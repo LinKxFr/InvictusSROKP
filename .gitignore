@@ -1,0 +1,18 @@
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Config (each user keeps their own)
+keypresser_config.json
+
+# UAC manifest (only needed at build time)
+keypresser.manifest
+
+# VS Code / JetBrains
+.vscode/
+.idea/
