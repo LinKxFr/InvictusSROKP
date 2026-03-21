@@ -21,12 +21,21 @@ import ctypes
 import time
 import threading
 import datetime
+import tempfile
+import subprocess
+import urllib.request
 import win32gui
 import win32process
 import win32con
 import win32api
 import psutil
 import keyboard
+
+# ==============================================================================
+# Version & update config
+# ==============================================================================
+APP_VERSION  = 3                          # bump this with every release
+GITHUB_REPO  = "LinKxFr/InvictusSROKP"   # used for update checks
 
 
 # ==============================================================================
@@ -313,6 +322,11 @@ class TimedActionEngine:
             if not self.running:
                 break
 
+            # Press ESC first so any open chat box / dialog is dismissed
+            # before the actual key lands (prevents accidental chat input).
+            send_vk_key(0x1B, hold_ms=50)   # VK_ESCAPE
+            time.sleep(0.15)
+
             send_vk_key(self.vk_code, hold_ms=self.hold_ms)
             self.log_cb(
                 f"[Timer] '{self.label}' pressed  "
@@ -380,12 +394,23 @@ class KeyPresserApp(tk.Tk):
         # ── Footer (bottom, packed before canvas so it stays pinned) ──────
         footer = tk.Frame(self, bg=BG2, height=28)
         footer.pack(fill="x", side="bottom")
+
+        # Update button — left side
+        upd_btn = tk.Button(footer, text="🔄 Check for Update",
+                            bg=BG2, fg=FG2, activebackground=BORDER,
+                            activeforeground=FG, relief="flat",
+                            font=("Segoe UI", 8), cursor="hand2",
+                            padx=6, pady=0)
+        upd_btn.pack(side="left", padx=8, pady=4)
+        upd_btn.config(command=lambda b=upd_btn: self._check_for_updates(b))
+
+        # Credits — right side
         _ft = tk.Frame(footer, bg=BG2)
         _ft.pack(side="right", padx=10, pady=4)
-        tk.Label(_ft, text="v2  —  Made by LinKx with ",
+        tk.Label(_ft, text=f"v{APP_VERSION}  —  Made by LinKx with ",
                  font=("Segoe UI", 9), fg=FG2, bg=BG2).pack(side="left")
         tk.Label(_ft, text="\u2665",
-                 font=("Segoe UI", 9, "bold"), fg=RED, bg=BG2).pack(side="left")
+                 font=("Segoe UI", 11, "bold"), fg=RED, bg=BG2).pack(side="left")
 
         # ── Scrollable canvas — all main content lives inside sf ──────────
         _canvas = tk.Canvas(self, bg=BG, highlightthickness=0, bd=0)
@@ -1130,6 +1155,122 @@ class KeyPresserApp(tk.Tk):
         self._log_text.insert("end", message + "\n", level)
         self._log_text.see("end")
         self._log_text.config(state="disabled")
+
+    # ======================================================================
+    # Auto-updater
+    # ======================================================================
+    def _check_for_updates(self, btn):
+        btn.config(state="disabled", text="Checking…")
+
+        def _thread():
+            try:
+                url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+                req = urllib.request.Request(
+                    url, headers={"User-Agent": "InvictusSROKP"})
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    data = json.load(r)
+
+                tag = data["tag_name"].lstrip("v")
+                try:
+                    latest = int(tag)
+                except ValueError:
+                    latest = 0
+
+                download_url = None
+                for asset in data.get("assets", []):
+                    if asset["name"].lower().endswith(".exe"):
+                        download_url = asset["browser_download_url"]
+                        break
+
+                self.after(0, _done, latest, download_url,
+                           data.get("name", f"v{latest}"))
+            except Exception as e:
+                self.after(0, _error, str(e))
+
+        def _done(latest, download_url, release_name):
+            btn.config(state="normal", text="🔄 Check for Update")
+            if latest <= APP_VERSION:
+                messagebox.showinfo(
+                    "Up to date",
+                    f"You're already on the latest version (v{APP_VERSION}). ✓")
+            elif not download_url:
+                messagebox.showwarning(
+                    "Update available",
+                    f"{release_name} is available but no .exe was found in the release.\n"
+                    f"Download manually from:\nhttps://github.com/{GITHUB_REPO}/releases")
+            else:
+                if messagebox.askyesno(
+                    "Update available",
+                    f"v{latest} is available  (you have v{APP_VERSION}).\n\n"
+                    f"Download and install now?\nThe app will restart automatically."):
+                    self._do_update(download_url)
+
+        def _error(msg):
+            btn.config(state="normal", text="🔄 Check for Update")
+            messagebox.showerror(
+                "Update check failed",
+                f"Could not reach GitHub:\n{msg}")
+
+        threading.Thread(target=_thread, daemon=True).start()
+
+    def _do_update(self, download_url: str):
+        """Download new exe to a temp file, write a bat that swaps it in, then exit."""
+        if not getattr(sys, "frozen", False):
+            messagebox.showinfo(
+                "Running from source",
+                "Auto-update only works with the .exe version.\n"
+                "Pull the latest code from GitHub manually.")
+            return
+
+        # Progress window
+        win = tk.Toplevel(self)
+        win.title("Downloading update…")
+        win.configure(bg=BG)
+        win.resizable(False, False)
+        win.grab_set()
+        tk.Label(win, text="Downloading update, please wait…",
+                 fg=FG, bg=BG, font=("Segoe UI", 10)).pack(padx=24, pady=(16, 6))
+        prog_var = tk.StringVar(value="0 %")
+        tk.Label(win, textvariable=prog_var, fg=TEAL, bg=BG,
+                 font=("Consolas", 12, "bold")).pack(pady=(0, 20))
+
+        tmp_exe = os.path.join(tempfile.gettempdir(), "InvictusSROKP_update.exe")
+
+        def _reporthook(blocks, block_size, total):
+            if total > 0:
+                pct = min(100, blocks * block_size * 100 // total)
+                self.after(0, prog_var.set, f"{pct} %")
+
+        def _thread():
+            try:
+                urllib.request.urlretrieve(download_url, tmp_exe, _reporthook)
+                self.after(0, _apply)
+            except Exception as e:
+                self.after(0, win.destroy)
+                self.after(0, lambda: messagebox.showerror(
+                    "Download failed", str(e)))
+
+        def _apply():
+            win.destroy()
+            exe = sys.executable
+            # Write a tiny bat: wait 2 s (so this process exits), swap files, relaunch
+            bat = os.path.join(tempfile.gettempdir(), "invictus_updater.bat")
+            with open(bat, "w") as f:
+                f.write(
+                    "@echo off\n"
+                    "timeout /t 2 /nobreak >nul\n"
+                    f'copy /y "{tmp_exe}" "{exe}"\n'
+                    f'start "" "{exe}"\n'
+                    f'del "{tmp_exe}"\n'
+                    'del "%~f0"\n'
+                )
+            subprocess.Popen(
+                ["cmd", "/c", bat],
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            self._on_close()
+
+        threading.Thread(target=_thread, daemon=True).start()
 
     # ======================================================================
     # Window close
