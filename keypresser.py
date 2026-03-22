@@ -194,23 +194,23 @@ def force_focus(hwnd: int):
         if fg_hwnd == hwnd:
             return   # already focused
 
-        # Tell Windows to allow the upcoming focus change
-        pid = win32process.GetWindowThreadProcessId(hwnd)[1]
-        ctypes.windll.user32.AllowSetForegroundWindow(pid)
-
-        # Temporarily attach our thread to the foreground thread so that
-        # SetForegroundWindow is not silently ignored by the OS
-        fg_tid  = win32process.GetWindowThreadProcessId(fg_hwnd)[0]
-        tgt_tid = win32process.GetWindowThreadProcessId(hwnd)[0]
-        attached = fg_tid != tgt_tid
-        if attached:
-            ctypes.windll.user32.AttachThreadInput(fg_tid, tgt_tid, True)
-        try:
+        # AttachThreadInput trick — only when there is a valid foreground window
+        if fg_hwnd:
+            fg_tid  = win32process.GetWindowThreadProcessId(fg_hwnd)[0]
+            tgt_tid = win32process.GetWindowThreadProcessId(hwnd)[0]
+            attached = fg_tid != tgt_tid
+            if attached:
+                ctypes.windll.user32.AttachThreadInput(fg_tid, tgt_tid, True)
+            try:
+                win32gui.BringWindowToTop(hwnd)
+                win32gui.SetForegroundWindow(hwnd)
+            finally:
+                if attached:
+                    ctypes.windll.user32.AttachThreadInput(fg_tid, tgt_tid, False)
+        else:
+            # No current foreground window — just set directly
             win32gui.BringWindowToTop(hwnd)
             win32gui.SetForegroundWindow(hwnd)
-        finally:
-            if attached:
-                ctypes.windll.user32.AttachThreadInput(fg_tid, tgt_tid, False)
     except Exception:
         pass
 
@@ -350,6 +350,20 @@ class TimedActionEngine:
             # ── Timer fired — press the key ───────────────────────────────
             if not self.running:
                 break
+
+            # One final focus push, then wait up to 500 ms for the OS to
+            # confirm the switch before we send any keystrokes.
+            force_focus(self.target_hwnd)
+            deadline = time.time() + 0.5
+            while time.time() < deadline:
+                if win32gui.GetForegroundWindow() == self.target_hwnd:
+                    break
+                time.sleep(0.05)
+
+            if win32gui.GetForegroundWindow() != self.target_hwnd:
+                self.log_cb(f"[Timer] '{self.label}' WARNING — window not focused at press time, retrying focus…")
+                force_focus(self.target_hwnd)
+                time.sleep(0.2)
 
             # Press ESC first so any open chat box / dialog is dismissed
             # before the actual key lands (prevents accidental chat input).
