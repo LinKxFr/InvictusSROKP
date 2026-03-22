@@ -180,6 +180,41 @@ def get_foreground_hwnd():
     return win32gui.GetForegroundWindow()
 
 
+def force_focus(hwnd: int):
+    """
+    Aggressively bring a window to the foreground.
+    Uses the AttachThreadInput trick so Windows doesn't block the focus request.
+    Also restores the window if it was minimised.
+    """
+    try:
+        if win32gui.IsIconic(hwnd):
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+
+        fg_hwnd = win32gui.GetForegroundWindow()
+        if fg_hwnd == hwnd:
+            return   # already focused
+
+        # Tell Windows to allow the upcoming focus change
+        pid = win32process.GetWindowThreadProcessId(hwnd)[1]
+        ctypes.windll.user32.AllowSetForegroundWindow(pid)
+
+        # Temporarily attach our thread to the foreground thread so that
+        # SetForegroundWindow is not silently ignored by the OS
+        fg_tid  = win32process.GetWindowThreadProcessId(fg_hwnd)[0]
+        tgt_tid = win32process.GetWindowThreadProcessId(hwnd)[0]
+        attached = fg_tid != tgt_tid
+        if attached:
+            ctypes.windll.user32.AttachThreadInput(fg_tid, tgt_tid, True)
+        try:
+            win32gui.BringWindowToTop(hwnd)
+            win32gui.SetForegroundWindow(hwnd)
+        finally:
+            if attached:
+                ctypes.windll.user32.AttachThreadInput(fg_tid, tgt_tid, False)
+    except Exception:
+        pass
+
+
 # ==============================================================================
 # KeyPresser engine — rapid sequence loop (existing feature)
 # ==============================================================================
@@ -259,14 +294,15 @@ class TimedActionEngine:
 
     def __init__(self, target_hwnd: int, vk_code: int, hold_ms: int,
                  interval_min: float, initial_min: float, label: str, log_cb,
-                 enter_after_ms: int = 0):
+                 enter_after_ms: int = 0, pre_focus_sec: float = 3.0):
         self.target_hwnd   = target_hwnd
         self.vk_code       = vk_code
         self.hold_ms       = hold_ms
         self.interval_sec  = interval_min * 60.0
         self.label         = label
         self.log_cb        = log_cb
-        self.enter_after_ms = enter_after_ms   # 0 = disabled
+        self.enter_after_ms  = enter_after_ms   # 0 = disabled
+        self.pre_focus_sec   = max(1.0, pre_focus_sec)
         self.running       = False
         self._thread       = None
         # next_trigger is a Unix timestamp; readable from the main thread
@@ -287,9 +323,6 @@ class TimedActionEngine:
         self.next_trigger = 0.0
 
     def _loop(self):
-        # How many seconds before the trigger we start forcing the window to foreground.
-        PRE_FOCUS_SEC = 2.0
-
         self.log_cb(
             f"[Timer] '{self.label}' started — first press in "
             f"{self._initial_sec/60:.1f} min, then every {self.interval_sec/60:.1f} min."
@@ -298,23 +331,19 @@ class TimedActionEngine:
         while self.running:
             remaining = self.next_trigger - time.time()
 
-            if remaining > PRE_FOCUS_SEC:
+            if remaining > self.pre_focus_sec:
                 # Still far from trigger — sleep in short bursts so stop() is responsive
                 time.sleep(0.5)
                 continue
 
             if remaining > 0:
-                # ── Pre-focus window: force the game to the foreground ────
-                # We do this every 100 ms for the last 2 seconds so the OS
-                # has plenty of time to complete the focus switch before the press.
-                try:
-                    win32gui.SetForegroundWindow(self.target_hwnd)
-                    self.log_cb(
-                        f"[Timer] '{self.label}' — forcing focus "
-                        f"({remaining:.1f}s to press)…"
-                    )
-                except Exception:
-                    pass
+                # ── Pre-focus window: aggressively force the game to the foreground ──
+                # Called every 100 ms for `pre_focus_sec` seconds before the press.
+                force_focus(self.target_hwnd)
+                self.log_cb(
+                    f"[Timer] '{self.label}' — forcing focus "
+                    f"({remaining:.1f}s to press)…"
+                )
                 time.sleep(0.1)
                 continue
 
@@ -580,8 +609,8 @@ class KeyPresserApp(tk.Tk):
     # ======================================================================
     # Pixel minwidths per column — shared by header row (row 0) and every
     # data row so that grid geometry guarantees perfect alignment.
-    _TA_COL_W = [28, 60, 68, 70, 70, 90, 28, 52, 28, 28, 28]
-    #             #  Key Hold Every Next  Cdown ↵?  ↵ms  ▶   ■   ✕
+    _TA_COL_W = [28, 60, 68, 70, 70, 30, 90, 28, 52, 28, 28, 28]
+    #             #  Key Hold Every Next  unit Cdown ↵?  ↵ms  ▶   ■   ✕
 
     def _build_timed_section(self):
         ta_outer = tk.LabelFrame(self._sf, text=" Timed Actions  (press & hold a key every N minutes) ",
@@ -597,8 +626,8 @@ class KeyPresserApp(tk.Tk):
         for col, minw in enumerate(self._TA_COL_W):
             self._timed_grid.columnconfigure(col, minsize=minw)
 
-        headers = ["#", "Key", "Hold\n(ms)", "Every\n(min)", "Next in\n(min)",
-                   "Countdown", "↵?", "↵ ms", "▶", "■", "✕"]
+        headers = ["#", "Key", "Hold\n(ms)", "Every\n(min)", "Next in",
+                   "", "Countdown", "↵?", "↵ ms", "▶", "■", "✕"]
         for col, txt in enumerate(headers):
             tk.Label(self._timed_grid, text=txt, anchor="center",
                      fg=FG2, bg=BG,
@@ -614,6 +643,7 @@ class KeyPresserApp(tk.Tk):
                 interval_min=ta.get("interval_min", 60),
                 initial_min=ta.get("initial_min", 60),
                 enter_after_ms=ta.get("enter_after_ms", 0),
+                initial_unit=ta.get("initial_unit", "min"),
             )
 
         ctrl = tk.Frame(ta_outer, bg=BG)
@@ -630,10 +660,20 @@ class KeyPresserApp(tk.Tk):
                   bg=BG3, fg=RED, activebackground=BORDER, activeforeground=FG,
                   relief="flat", padx=8, pady=3, font=("Segoe UI", 9),
                   cursor="hand2").pack(side="left", padx=(4, 0))
-        tk.Label(ctrl,
-                 text='  "Next in" = minutes until first press  '
-                      '(e.g. buff has 48 min left -> set 48, repeat every 60)',
-                 fg=FG2, bg=BG, font=("Segoe UI", 7, "italic")).pack(side="left", padx=6)
+
+        # Pre-focus seconds input
+        tk.Label(ctrl, text="  Pre-focus:", fg=FG2, bg=BG,
+                 font=("Segoe UI", 8)).pack(side="left", padx=(8, 2))
+        self._prefocus_var = tk.IntVar(value=self.config_data.get("prefocus_sec", 3))
+        _vcmd_pf = (self.register(lambda s: s.isdigit() or s == ''), '%P')
+        tk.Spinbox(ctrl, from_=1, to=30, textvariable=self._prefocus_var, width=3,
+                   bg=BG3, fg=TEAL, insertbackground=FG, buttonbackground=BG3,
+                   relief="flat", font=("Consolas", 9),
+                   validate='key', validatecommand=_vcmd_pf
+                   ).pack(side="left")
+        tk.Label(ctrl, text="s", fg=FG2, bg=BG,
+                 font=("Segoe UI", 8)).pack(side="left", padx=(2, 0))
+
         # Live/idle indicator — updated every 500 ms by _tick_countdowns()
         self._timed_status_lbl = tk.Label(ctrl, text="● Idle",
                                           fg=RED, bg=BG, font=("Segoe UI", 8, "bold"))
@@ -641,7 +681,8 @@ class KeyPresserApp(tk.Tk):
 
     def _add_timed_row(self, key: str = "", vk: int = 0,
                        hold_ms: int = 200, interval_min: int = 60,
-                       initial_min: int = 60, enter_after_ms: int = 0):
+                       initial_min: int = 60, enter_after_ms: int = 0,
+                       initial_unit: str = "min"):
         # grid row = position + 1 (row 0 is the header)
         grid_row = len(self._timed_rows) + 1
 
@@ -659,13 +700,17 @@ class KeyPresserApp(tk.Tk):
                              relief="flat", font=("Consolas", 9), justify="center")
         key_entry.grid(row=grid_row, column=1, padx=1, pady=2, sticky="ew")
 
+        # Digit-only validation command — shared by all numeric spinboxes in this row
+        _vcmd = (self.register(lambda s: s.isdigit() or s == ''), '%P')
+
         # ── Hold spinbox ──────────────────────────────────────────────────
         hold_var = tk.IntVar(value=hold_ms)
         hold_spin = tk.Spinbox(self._timed_grid, from_=50, to=9999,
                                textvariable=hold_var, width=5,
                                bg=BG3, fg=FG, insertbackground=FG,
                                buttonbackground=BG3, relief="flat",
-                               font=("Consolas", 9))
+                               font=("Consolas", 9),
+                               validate='key', validatecommand=_vcmd)
         hold_spin.grid(row=grid_row, column=2, padx=1, pady=2, sticky="ew")
 
         # ── Interval spinbox ──────────────────────────────────────────────
@@ -674,39 +719,58 @@ class KeyPresserApp(tk.Tk):
                                    textvariable=interval_var, width=5,
                                    bg=BG3, fg=FG, insertbackground=FG,
                                    buttonbackground=BG3, relief="flat",
-                                   font=("Consolas", 9))
+                                   font=("Consolas", 9),
+                                   validate='key', validatecommand=_vcmd)
         interval_spin.grid(row=grid_row, column=3, padx=1, pady=2, sticky="ew")
 
-        # ── "Next in" spinbox ─────────────────────────────────────────────
-        # Highlighted yellow — the user sets this once to match remaining buff
-        # time before starting. After the first press, only interval_var is used.
-        initial_var = tk.IntVar(value=initial_min)
+        # ── "Next in" spinbox (col 4) ─────────────────────────────────────
+        # Value is in whatever unit the toggle says (min or sec).
+        initial_display = round(initial_min * 60) if initial_unit == "sec" else round(initial_min)
+        initial_var = tk.IntVar(value=initial_display)
         initial_spin = tk.Spinbox(self._timed_grid, from_=0, to=9999,
                                   textvariable=initial_var, width=5,
                                   bg=BG3, fg=YELLOW, insertbackground=FG,
                                   buttonbackground=BG3, relief="flat",
-                                  font=("Consolas", 9))
+                                  font=("Consolas", 9),
+                                  validate='key', validatecommand=_vcmd)
         initial_spin.grid(row=grid_row, column=4, padx=1, pady=2, sticky="ew")
 
-        # ── Live countdown label ───────────────────────────────────────────
+        # ── Unit toggle button (col 5) ────────────────────────────────────
+        # Clicking switches "Next in" between minutes and seconds.
+        initial_unit_var = tk.StringVar(value=initial_unit)
+        unit_btn = tk.Button(self._timed_grid,
+                             text=initial_unit,
+                             fg=TEAL if initial_unit == "sec" else YELLOW,
+                             bg=BG3, activebackground=BORDER, activeforeground=FG,
+                             relief="flat", font=("Consolas", 8), cursor="hand2")
+        unit_btn.grid(row=grid_row, column=5, padx=1, pady=2, sticky="ew")
+
+        def _toggle_unit(uv=initial_unit_var, ub=unit_btn):
+            nxt = "sec" if uv.get() == "min" else "min"
+            uv.set(nxt)
+            ub.config(text=nxt, fg=TEAL if nxt == "sec" else YELLOW)
+
+        unit_btn.config(command=_toggle_unit)
+
+        # ── Live countdown label (col 6) ──────────────────────────────────
         # Ticked every 500 ms by _tick_countdowns(); colour shifts
         # TEAL → YELLOW → RED as the next press approaches.
         countdown_var = tk.StringVar(value="——:——")
         cd_lbl = tk.Label(self._timed_grid, textvariable=countdown_var,
                           anchor="center", fg=TEAL, bg=BG,
                           font=("Consolas", 9, "bold"))
-        cd_lbl.grid(row=grid_row, column=5, padx=1, pady=2, sticky="ew")
+        cd_lbl.grid(row=grid_row, column=6, padx=1, pady=2, sticky="ew")
 
-        # ── Enter-after checkbox (col 6) ──────────────────────────────────
+        # ── Enter-after checkbox (col 7) ──────────────────────────────────
         # When checked, the engine sends Enter N ms after the main key press.
         enter_var = tk.BooleanVar(value=bool(enter_after_ms))
         enter_chk = tk.Checkbutton(self._timed_grid, variable=enter_var,
                                    bg=BG, activebackground=BG,
                                    selectcolor=BG3, relief="flat",
                                    cursor="hand2")
-        enter_chk.grid(row=grid_row, column=6, padx=1, pady=2)
+        enter_chk.grid(row=grid_row, column=7, padx=1, pady=2)
 
-        # ── Enter-delay spinbox (col 7) ───────────────────────────────────
+        # ── Enter-delay spinbox (col 8) ───────────────────────────────────
         # Active value in ms; only used when enter_var is True.
         enter_ms_val = enter_after_ms if enter_after_ms > 0 else 1500
         enter_ms_var = tk.IntVar(value=enter_ms_val)
@@ -714,55 +778,57 @@ class KeyPresserApp(tk.Tk):
                                    textvariable=enter_ms_var, width=4,
                                    bg=BG3, fg=TEAL, insertbackground=FG,
                                    buttonbackground=BG3, relief="flat",
-                                   font=("Consolas", 9))
-        enter_ms_spin.grid(row=grid_row, column=7, padx=1, pady=2, sticky="ew")
+                                   font=("Consolas", 9),
+                                   validate='key', validatecommand=_vcmd)
+        enter_ms_spin.grid(row=grid_row, column=8, padx=1, pady=2, sticky="ew")
 
         # ── VK code (internal only, not displayed) ───────────────────────
         vk_var     = tk.IntVar(value=vk)
         vk_lbl_var = tk.StringVar(value=f"0x{vk:02X}" if vk else "—")
 
-        # ── Start button (col 8) ──────────────────────────────────────────
+        # ── Start button (col 9) ──────────────────────────────────────────
         start_btn = tk.Button(self._timed_grid, text="▶",
                               bg=BG3, fg=GREEN, activebackground=BORDER,
                               activeforeground=GREEN, relief="flat",
                               font=("Segoe UI", 9, "bold"), cursor="hand2")
-        start_btn.grid(row=grid_row, column=8, padx=1, pady=2, sticky="ew")
+        start_btn.grid(row=grid_row, column=9, padx=1, pady=2, sticky="ew")
 
-        # ── Stop button (col 9) ───────────────────────────────────────────
+        # ── Stop button (col 10) ──────────────────────────────────────────
         stop_btn = tk.Button(self._timed_grid, text="■",
                              bg=BG3, fg=RED, activebackground=BORDER,
                              activeforeground=RED, relief="flat",
                              font=("Segoe UI", 9, "bold"), cursor="hand2",
                              state="disabled")
-        stop_btn.grid(row=grid_row, column=9, padx=1, pady=2, sticky="ew")
+        stop_btn.grid(row=grid_row, column=10, padx=1, pady=2, sticky="ew")
 
-        # ── Delete button (col 10) ────────────────────────────────────────
+        # ── Delete button (col 11) ────────────────────────────────────────
         del_btn = tk.Button(self._timed_grid, text="✕",
                             bg=BG, fg=RED, activebackground=BORDER,
                             activeforeground=RED, relief="flat",
                             font=("Segoe UI", 9), cursor="hand2")
-        del_btn.grid(row=grid_row, column=10, padx=1, pady=2, sticky="ew")
+        del_btn.grid(row=grid_row, column=11, padx=1, pady=2, sticky="ew")
 
         # ── Row data dict ──────────────────────────────────────────────────
         row = {
-            "key_var":        key_var,
-            "vk_var":         vk_var,
-            "vk_lbl_var":     vk_lbl_var,
-            "hold_var":       hold_var,
-            "interval_var":   interval_var,
-            "initial_var":    initial_var,
-            "countdown_var":  countdown_var,
-            "cd_lbl":         cd_lbl,        # direct ref for colour changes
-            "enter_var":      enter_var,      # BooleanVar — send Enter?
-            "enter_ms_var":   enter_ms_var,   # IntVar — delay before Enter
-            "start_btn":      start_btn,
-            "stop_btn":       stop_btn,
-            "engine":         None,
-            "idx_lbl":        idx_lbl,
+            "key_var":          key_var,
+            "vk_var":           vk_var,
+            "vk_lbl_var":       vk_lbl_var,
+            "hold_var":         hold_var,
+            "interval_var":     interval_var,
+            "initial_var":      initial_var,
+            "initial_unit_var": initial_unit_var,  # "min" or "sec"
+            "countdown_var":    countdown_var,
+            "cd_lbl":           cd_lbl,        # direct ref for colour changes
+            "enter_var":        enter_var,      # BooleanVar — send Enter?
+            "enter_ms_var":     enter_ms_var,   # IntVar — delay before Enter
+            "start_btn":        start_btn,
+            "stop_btn":         stop_btn,
+            "engine":           None,
+            "idx_lbl":          idx_lbl,
             # All grid widgets for this row — used during deletion
             "_grid_widgets": [idx_lbl, key_entry, hold_spin, interval_spin,
-                              initial_spin, cd_lbl, enter_chk, enter_ms_spin,
-                              start_btn, stop_btn, del_btn],
+                              initial_spin, unit_btn, cd_lbl, enter_chk,
+                              enter_ms_spin, start_btn, stop_btn, del_btn],
         }
         self._timed_rows.append(row)
 
@@ -808,8 +874,10 @@ class KeyPresserApp(tk.Tk):
         label          = row["key_var"].get() or f"VK=0x{vk:02X}"
         hold_ms        = max(50, row["hold_var"].get())
         interval_min   = max(1, row["interval_var"].get())
-        initial_min    = max(0, row["initial_var"].get())
+        raw_initial    = max(0, row["initial_var"].get())
+        initial_min    = raw_initial / 60.0 if row["initial_unit_var"].get() == "sec" else float(raw_initial)
         enter_after_ms = row["enter_ms_var"].get() if row["enter_var"].get() else 0
+        pre_focus_sec  = max(1, self._prefocus_var.get())
 
         engine = TimedActionEngine(
             target_hwnd    = self._target_hwnd,
@@ -820,6 +888,7 @@ class KeyPresserApp(tk.Tk):
             label          = label,
             log_cb         = lambda msg: self._log(msg, "timer"),
             enter_after_ms = enter_after_ms,
+            pre_focus_sec  = pre_focus_sec,
         )
         engine.start()
         row["engine"] = engine
@@ -1102,13 +1171,17 @@ class KeyPresserApp(tk.Tk):
             if not k:
                 continue
             vk = row["vk_var"].get() or KEY_NAME_TO_VK.get(k.lower(), 0)
-            enter_ms = row["enter_ms_var"].get() if row["enter_var"].get() else 0
+            enter_ms     = row["enter_ms_var"].get() if row["enter_var"].get() else 0
+            unit         = row["initial_unit_var"].get()
+            raw_initial  = max(0, row["initial_var"].get())
+            initial_min  = raw_initial / 60.0 if unit == "sec" else float(raw_initial)
             actions.append({
                 "key":            k,
                 "vk":             vk,
                 "hold_ms":        max(50, row["hold_var"].get()),
                 "interval_min":   max(1, row["interval_var"].get()),
-                "initial_min":    max(0, row["initial_var"].get()),
+                "initial_min":    initial_min,
+                "initial_unit":   unit,
                 "enter_after_ms": enter_ms,
             })
         return actions
@@ -1120,6 +1193,7 @@ class KeyPresserApp(tk.Tk):
             "hotkey_start":   self._hk_start_var.get().strip(),
             "hotkey_stop":    self._hk_stop_var.get().strip(),
             "target_window":  self.window_combo.get(),
+            "prefocus_sec":   max(1, self._prefocus_var.get()),
         }
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
