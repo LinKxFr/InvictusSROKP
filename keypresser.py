@@ -705,13 +705,16 @@ class KeyPresserApp(tk.Tk):
                            fg=FG2, bg=BG, font=("Consolas", 9))
         idx_lbl.grid(row=grid_row, column=0, padx=1, pady=2, sticky="ew")
 
-        # ── Key entry ─────────────────────────────────────────────────────
-        # width=6 caps the column at ~42 px (Consolas 9) so the grid fits
-        key_var = tk.StringVar(value=key)
+        # ── Key entry (read-only, click-to-capture) ───────────────────────
+        # No free-text input allowed — clicking triggers physical key capture.
+        key_var = tk.StringVar(value=key if key else "⊙ key")
         key_entry = tk.Entry(self._timed_grid, textvariable=key_var,
                              width=6,
-                             bg=BG3, fg=FG, insertbackground=FG,
-                             relief="flat", font=("Consolas", 9), justify="center")
+                             bg=BG3, fg=YELLOW if not key else FG,
+                             insertbackground=FG, relief="flat",
+                             font=("Consolas", 9), justify="center",
+                             state="readonly", cursor="hand2",
+                             readonlybackground=BG3)
         key_entry.grid(row=grid_row, column=1, padx=1, pady=2, sticky="ew")
 
         # Digit-only validation command — shared by all numeric spinboxes in this row
@@ -850,6 +853,11 @@ class KeyPresserApp(tk.Tk):
         start_btn.config(command=lambda r=row: self._start_timed(r))
         stop_btn.config(command=lambda r=row: self._stop_timed(r))
 
+        # Clicking the key field triggers capture (read-only — no free typing)
+        key_entry.bind("<Button-1>", lambda e, kv=key_var, vv=vk_var,
+                       vlv=vk_lbl_var, en=key_entry:
+                       self._run_capture_entry(kv, vv, vlv, en))
+
         def _delete(r=row):
             self._stop_timed(r)
             for w in r["_grid_widgets"]:
@@ -875,17 +883,18 @@ class KeyPresserApp(tk.Tk):
         if row["engine"] is not None:
             return   # already running
 
+        raw_key = row["key_var"].get().strip()
         vk = row["vk_var"].get()
-        if not vk:
-            vk = KEY_NAME_TO_VK.get(row["key_var"].get().strip().lower(), 0)
+        if not vk and raw_key not in ("", "⊙ key"):
+            vk = KEY_NAME_TO_VK.get(raw_key.lower(), 0)
         if not vk:
             messagebox.showwarning(
                 "No Key Captured",
-                "Use the ⊙ Capture button to assign a key to this timed action first."
+                "Click the key field (⊙ key) and press the physical key you want to assign first."
             )
             return
 
-        label          = row["key_var"].get() or f"VK=0x{vk:02X}"
+        label          = raw_key if raw_key not in ("", "⊙ key") else f"VK=0x{vk:02X}"
         hold_ms        = max(50, row["hold_var"].get())
         interval_min   = max(1, row["interval_var"].get())
         raw_initial    = max(0, row["initial_var"].get())
@@ -987,26 +996,34 @@ class KeyPresserApp(tk.Tk):
         tk.Label(frame, text=str(idx), width=3, anchor="center",
                  fg=FG2, bg=BG2, font=("Consolas", 9)).pack(side="left")
 
+        # Read-only — only the Capture button can populate this field
         key_var = tk.StringVar(value=key)
-        tk.Entry(frame, textvariable=key_var, width=7, bg=BG3, fg=FG,
-                 insertbackground=FG, relief="flat", font=("Consolas", 10),
-                 justify="center").pack(side="left", padx=4)
+        key_entry = tk.Entry(frame, textvariable=key_var, width=7,
+                             bg=BG3, fg=FG, insertbackground=FG, relief="flat",
+                             font=("Consolas", 10), justify="center",
+                             state="readonly", cursor="hand2",
+                             readonlybackground=BG3)
+        key_entry.pack(side="left", padx=4)
 
         vk_var     = tk.IntVar(value=vk)
         vk_lbl_var = tk.StringVar(value=f"0x{vk:02X}" if vk else "—")
         tk.Label(frame, textvariable=vk_lbl_var, width=7, anchor="center",
                  fg=ACCENT2, bg=BG2, font=("Consolas", 9)).pack(side="left", padx=4)
 
+        _vcmd_seq = (self.register(lambda s: s.isdigit() or s == ''), '%P')
         delay_var = tk.IntVar(value=delay_ms)
         tk.Spinbox(frame, from_=1, to=9999, textvariable=delay_var, width=7,
                    bg=BG3, fg=FG, insertbackground=FG, buttonbackground=BG3,
-                   relief="flat", font=("Consolas", 10)).pack(side="left", padx=4)
+                   relief="flat", font=("Consolas", 10),
+                   validate='key', validatecommand=_vcmd_seq).pack(side="left", padx=4)
 
         capture_btn = tk.Button(frame, text="⊙ Capture",
                                 bg=BG3, fg=YELLOW, activebackground=BORDER,
                                 activeforeground=FG, relief="flat",
                                 font=("Segoe UI", 8), cursor="hand2", padx=4)
         capture_btn.pack(side="left", padx=2)
+        # Clicking the key field itself also triggers capture
+        key_entry.bind("<Button-1>", lambda e, b=capture_btn: b.invoke())
 
         del_btn = tk.Button(frame, text="✕", bg=BG2, fg=RED, activebackground=BORDER,
                             activeforeground=RED, relief="flat",
@@ -1082,6 +1099,50 @@ class KeyPresserApp(tk.Tk):
 
         def _restore():
             btn.config(text=orig, fg=YELLOW, state="normal")
+            self._capturing = False
+
+        threading.Thread(target=_thread, daemon=True).start()
+
+    def _run_capture_entry(self, key_var, vk_var, vk_lbl_var, entry):
+        """Capture variant for read-only Entry widgets (timed action rows).
+        The entry itself acts as the visual feedback element."""
+        if self._capturing:
+            return
+        self._capturing = True
+        orig_text = key_var.get()
+        orig_fg   = entry.cget("readonlybackground") and FG  # keep ref
+        key_var.set("▸ press…")
+        entry.config(fg=GREEN)
+        self._log("Capture: press the physical key you want to assign…", "info")
+
+        def _thread():
+            try:
+                event = keyboard.read_event(suppress=True)
+                while event.event_type != keyboard.KEY_DOWN:
+                    event = keyboard.read_event(suppress=True)
+
+                name      = event.name
+                scan_code = event.scan_code
+                vk_code   = ctypes.windll.user32.MapVirtualKeyW(scan_code, 3)
+                if vk_code == 0:
+                    vk_code = KEY_NAME_TO_VK.get(name.lower(), 0)
+
+                self.after(0, _apply, name, vk_code)
+            except Exception as e:
+                self.after(0, lambda: self._log(f"Capture error: {e}", "error"))
+                self.after(0, _restore, orig_text)
+
+        def _apply(name, vk_code):
+            key_var.set(name)
+            vk_var.set(vk_code)
+            vk_lbl_var.set(f"0x{vk_code:02X}" if vk_code else "—")
+            entry.config(fg=FG)
+            self._log(f"Captured: '{name}'  VK=0x{vk_code:02X}", "info")
+            self._capturing = False
+
+        def _restore(fallback="⊙ key"):
+            key_var.set(fallback if fallback in ("⊙ key", "") else fallback)
+            entry.config(fg=YELLOW if fallback == "⊙ key" else FG)
             self._capturing = False
 
         threading.Thread(target=_thread, daemon=True).start()
