@@ -42,6 +42,7 @@ except ImportError:
 
 try:
     import pytesseract
+    pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
     _OCR_AVAILABLE = True
 except ImportError:
     _OCR_AVAILABLE = False
@@ -49,7 +50,7 @@ except ImportError:
 # ==============================================================================
 # Version & update config
 # ==============================================================================
-APP_VERSION  = 5                          # bump this with every release
+APP_VERSION  = 6                          # bump this with every release
 GITHUB_REPO  = "LinKxFr/InvictusSROKP"   # used for update checks
 
 
