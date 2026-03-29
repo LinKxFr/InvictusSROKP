@@ -33,11 +33,17 @@ import keyboard
 
 try:
     import cv2
-    from PIL import ImageGrab
+    from PIL import ImageGrab, ImageEnhance
     import numpy as np
     _IMAGE_MATCHING = True
 except ImportError:
     _IMAGE_MATCHING = False
+
+try:
+    import pytesseract
+    _OCR_AVAILABLE = True
+except ImportError:
+    _OCR_AVAILABLE = False
 
 # ==============================================================================
 # Version & update config
@@ -110,8 +116,10 @@ DEFAULT_CONFIG = {
     "hotkey_start": "F6",
     "hotkey_stop":  "F7",
     "target_window": "",
-    "alchemy_delay_ms": 500,
-    "alchemy_hotkey":   "F8",
+    "alchemy_delay_ms":   3500,
+    "alchemy_hotkey":     "F8",
+    "alchemy_text_region": None,   # [x, y, w, h] in screen coords
+    "alchemy_stop_text":  "changed to [5].",
 }
 
 # --------------------------------------------------------------------------
@@ -437,12 +445,17 @@ class AlchemyEngine:
     """
 
     def __init__(self, target_hwnd: int, delay_ms: int, log_cb,
-                 template_path: str = ""):
-        self.target_hwnd   = target_hwnd
-        self.delay_ms      = max(100, delay_ms)
-        self.log_cb        = log_cb
+                 template_path: str = "",
+                 text_region=None, stop_text: str = "",
+                 stop_cb=None):
+        self.target_hwnd  = target_hwnd
+        self.delay_ms     = max(100, delay_ms)
+        self.log_cb       = log_cb
         self.template_path = template_path
-        self.running       = False
+        self.text_region  = text_region   # [x, y, w, h] or None
+        self.stop_text    = stop_text.strip().lower()
+        self.stop_cb      = stop_cb       # called (no args) when stop condition met
+        self.running      = False
         self._thread: threading.Thread | None = None
 
     def start(self):
@@ -453,20 +466,47 @@ class AlchemyEngine:
     def stop(self):
         self.running = False
 
+    def _ocr_region(self) -> str:
+        """Screenshot the configured text region and return OCR text, or ''."""
+        if not _OCR_AVAILABLE or not _IMAGE_MATCHING or not self.text_region:
+            return ""
+        try:
+            x, y, w, h = self.text_region
+            img = ImageGrab.grab(bbox=(x, y, x + w, y + h))
+            # Upscale + boost contrast so Tesseract handles game fonts better
+            img = img.resize((w * 2, h * 2))
+            img = ImageEnhance.Contrast(img).enhance(2.5)
+            img = img.convert("L")   # greyscale
+            return pytesseract.image_to_string(img)
+        except Exception:
+            return ""
+
     def _loop(self):
         use_template = bool(self.template_path and os.path.exists(self.template_path)
                             and _IMAGE_MATCHING)
-        mode = "image targeting" if use_template else "cursor position"
-        self.log_cb(f"[Alchemy] Auto-clicker started ({mode}).")
+        use_ocr_stop = bool(self.stop_text and self.text_region and _OCR_AVAILABLE)
+        mode_parts   = []
+        if use_template:  mode_parts.append("image targeting")
+        if use_ocr_stop:  mode_parts.append(f"stop at '{self.stop_text}'")
+        self.log_cb(f"[Alchemy] Started ({', '.join(mode_parts) or 'cursor position'}).")
         _miss_count = 0
 
         while self.running:
+            # ── Stop-condition check (before clicking) ────────────────────
+            if use_ocr_stop:
+                ocr = self._ocr_region()
+                if self.stop_text in ocr.lower():
+                    self.log_cb("[Alchemy] Stop condition met — target reached!")
+                    self.running = False
+                    if self.stop_cb:
+                        self.stop_cb()
+                    break
+
             if win32gui.GetForegroundWindow() == self.target_hwnd:
                 if use_template:
                     pos = find_on_screen(self.template_path)
                     if pos:
                         _miss_count = 0
-                        # Move cursor to the button, then click
                         ctypes.windll.user32.SetCursorPos(pos[0], pos[1])
                         time.sleep(0.05)
                         ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)
@@ -477,10 +517,10 @@ class AlchemyEngine:
                         if _miss_count % 5 == 1:
                             self.log_cb("[Alchemy] Fuse button not found on screen…")
                 else:
-                    # No template — click wherever the cursor already is
                     ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)
                     time.sleep(0.05)
                     ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)
+
             time.sleep(self.delay_ms / 1000.0)
         self.log_cb("[Alchemy] Auto-clicker stopped.")
 
@@ -843,16 +883,16 @@ class KeyPresserApp(tk.Tk):
         tk.Label(row, textvariable=self._alchemy_status_var,
                  fg=FG2, bg=BG, font=("Segoe UI", 9)).pack(side="left")
 
-        # ── Second row: image targeting ───────────────────────────────────
+        # ── Row 2: Fuse button image targeting ────────────────────────────
         row2 = tk.Frame(outer, bg=BG)
-        row2.pack(fill="x", padx=10, pady=(0, 8))
+        row2.pack(fill="x", padx=10, pady=(0, 4))
 
         tk.Button(row2, text="📷 Set Fuse",
                   command=self._alchemy_capture_template,
                   bg=BG3, fg="#fab387", activebackground=BORDER, activeforeground=FG,
                   relief="flat", padx=8, pady=2, font=("Segoe UI", 8),
                   cursor="hand2").pack(side="left")
-        tk.Label(row2, text="  Hover over the Fuse button, then click — 3s countdown",
+        tk.Label(row2, text="  Hover over the Fuse button — 3s countdown",
                  fg=FG2, bg=BG, font=("Segoe UI", 7, "italic")).pack(side="left", padx=4)
 
         has_tpl = os.path.exists(ALCHEMY_TEMPLATE_PATH)
@@ -861,6 +901,34 @@ class KeyPresserApp(tk.Tk):
             text="✓ Template set" if has_tpl else "No template — clicking at cursor",
             fg=GREEN if has_tpl else FG2, bg=BG, font=("Segoe UI", 8))
         self._alchemy_template_lbl.pack(side="right", padx=4)
+
+        # ── Row 3: OCR stop condition ──────────────────────────────────────
+        row3 = tk.Frame(outer, bg=BG)
+        row3.pack(fill="x", padx=10, pady=(0, 8))
+
+        tk.Button(row3, text="📷 Set Text Area",
+                  command=self._alchemy_capture_text_region,
+                  bg=BG3, fg=TEAL, activebackground=BORDER, activeforeground=FG,
+                  relief="flat", padx=8, pady=2, font=("Segoe UI", 8),
+                  cursor="hand2").pack(side="left")
+        tk.Label(row3, text="  Stop when:", fg=FG2, bg=BG,
+                 font=("Segoe UI", 8)).pack(side="left", padx=(8, 2))
+        self._alchemy_stop_text_var = tk.StringVar(
+            value=self.config_data.get("alchemy_stop_text", "changed to [5]."))
+        tk.Entry(row3, textvariable=self._alchemy_stop_text_var, width=28,
+                 bg=BG3, fg=TEAL, insertbackground=FG, relief="flat",
+                 font=("Consolas", 8)).pack(side="left", padx=(0, 8))
+
+        has_rgn = bool(self.config_data.get("alchemy_text_region"))
+        self._alchemy_region_lbl = tk.Label(
+            row3,
+            text="✓ Region set" if has_rgn else "No region",
+            fg=GREEN if has_rgn else FG2, bg=BG, font=("Segoe UI", 8))
+        self._alchemy_region_lbl.pack(side="left")
+
+        if not _OCR_AVAILABLE:
+            tk.Label(row3, text="  ⚠ pytesseract not installed",
+                     fg=YELLOW, bg=BG, font=("Segoe UI", 7, "italic")).pack(side="left", padx=4)
 
     def toggle_alchemy(self):
         if self._alchemy_engine and self._alchemy_engine.running:
@@ -876,10 +944,13 @@ class KeyPresserApp(tk.Tk):
             return
         delay_ms = max(100, self._alchemy_delay_var.get())
         self._alchemy_engine = AlchemyEngine(
-            target_hwnd=self._target_hwnd,
-            delay_ms=delay_ms,
-            log_cb=lambda msg: self._log(msg, "info"),
-            template_path=ALCHEMY_TEMPLATE_PATH,
+            target_hwnd   = self._target_hwnd,
+            delay_ms      = delay_ms,
+            log_cb        = lambda msg: self._log(msg, "info"),
+            template_path = ALCHEMY_TEMPLATE_PATH,
+            text_region   = self.config_data.get("alchemy_text_region"),
+            stop_text     = self._alchemy_stop_text_var.get(),
+            stop_cb       = lambda: self.after(0, self.stop_alchemy),
         )
         self._alchemy_engine.start()
         self._alchemy_btn.config(text="■ Stop")
@@ -929,6 +1000,45 @@ class KeyPresserApp(tk.Tk):
             self.after(0, lambda: self._alchemy_template_lbl.config(
                 text="✓ Template set", fg=GREEN))
             self.after(0, lambda: self._log("[Alchemy] Fuse button template saved.", "info"))
+
+        threading.Thread(target=_do_capture, daemon=True).start()
+
+    def _alchemy_capture_text_region(self):
+        """3-second countdown, then saves the cursor position as the OCR text region."""
+        if self._alchemy_engine and self._alchemy_engine.running:
+            messagebox.showwarning("Alchemy Running",
+                                   "Stop the auto-clicker before changing the text region.")
+            return
+        if not _OCR_AVAILABLE:
+            messagebox.showerror("pytesseract not installed",
+                "Install pytesseract and Tesseract OCR to use the stop condition:\n"
+                "  1. pip install pytesseract\n"
+                "  2. Download Tesseract: https://github.com/UB-Mannheim/tesseract/wiki")
+            return
+
+        self._log("[Alchemy] Minimizing in 1 s — hover over the success text area. Capturing in 3 s…", "info")
+
+        def _do_capture():
+            time.sleep(1.0)
+            self.after(0, self.iconify)
+            time.sleep(3.0)
+
+            class _PT(ctypes.Structure):
+                _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+            pt = _PT()
+            ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+            cx, cy = pt.x, pt.y
+
+            # 500 × 100 px region centered on cursor — covers several chat lines
+            w, h = 500, 100
+            region = [max(0, cx - w // 2), max(0, cy - h // 2), w, h]
+
+            self.config_data["alchemy_text_region"] = region
+            self.after(0, self.deiconify)
+            self.after(0, lambda: self._alchemy_region_lbl.config(
+                text="✓ Region set", fg=GREEN))
+            self.after(0, lambda: self._log(
+                f"[Alchemy] Text region set to {region}.", "info"))
 
         threading.Thread(target=_do_capture, daemon=True).start()
 
@@ -1513,8 +1623,10 @@ class KeyPresserApp(tk.Tk):
             "hotkey_stop":       self._hk_stop_var.get().strip(),
             "target_window":     self.window_combo.get(),
             "prefocus_sec":      max(1, self._prefocus_var.get()),
-            "alchemy_delay_ms":  max(100, self._alchemy_delay_var.get()),
-            "alchemy_hotkey":    self._alchemy_hk_var.get().strip(),
+            "alchemy_delay_ms":   max(100, self._alchemy_delay_var.get()),
+            "alchemy_hotkey":     self._alchemy_hk_var.get().strip(),
+            "alchemy_text_region": self.config_data.get("alchemy_text_region"),
+            "alchemy_stop_text":  self._alchemy_stop_text_var.get().strip(),
         }
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
