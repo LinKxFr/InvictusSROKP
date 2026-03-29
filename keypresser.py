@@ -34,7 +34,7 @@ import keyboard
 
 try:
     import cv2
-    from PIL import ImageGrab, ImageEnhance, ImageTk
+    from PIL import Image, ImageGrab, ImageEnhance, ImageTk
     import numpy as np
     _IMAGE_MATCHING = True
 except ImportError:
@@ -50,7 +50,7 @@ except ImportError:
 # ==============================================================================
 # Version & update config
 # ==============================================================================
-APP_VERSION  = 6                          # bump this with every release
+APP_VERSION  = 7                          # bump this with every release
 GITHUB_REPO  = "LinKxFr/InvictusSROKP"   # used for update checks
 
 
@@ -476,11 +476,20 @@ class AlchemyEngine:
         try:
             x, y, w, h = self.text_region
             img = ImageGrab.grab(bbox=(x, y, x + w, y + h))
-            # Upscale + boost contrast so Tesseract handles game fonts better
-            img = img.resize((w * 2, h * 2))
-            img = ImageEnhance.Contrast(img).enhance(2.5)
-            img = img.convert("L")   # greyscale
-            return pytesseract.image_to_string(img)
+            # 3× upscale with high-quality resampling for better glyph detail
+            img = img.resize((w * 3, h * 3), resample=Image.LANCZOS)
+            img = img.convert("L")                       # greyscale
+            # Otsu binarization — finds optimal threshold automatically,
+            # much cleaner than a fixed contrast boost for game UI fonts
+            arr = np.array(img)
+            _, binary = cv2.threshold(arr, 0, 255,
+                                      cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            # Invert: game text is light on dark bg;
+            # Tesseract works best with dark text on white background
+            binary = cv2.bitwise_not(binary)
+            img = Image.fromarray(binary)
+            # PSM 6 = assume a uniform block of text (best for chat-line regions)
+            return pytesseract.image_to_string(img, config="--psm 6")
         except Exception as e:
             self.log_cb(f"[Alchemy] OCR error: {e}")
             return ""
@@ -1118,10 +1127,14 @@ class KeyPresserApp(tk.Tk):
         try:
             x, y, w, h = region
             img = ImageGrab.grab(bbox=(x, y, x + w, y + h))
-            img = img.resize((w * 2, h * 2))
-            img = ImageEnhance.Contrast(img).enhance(2.5)
+            img = img.resize((w * 3, h * 3), resample=Image.LANCZOS)
             img = img.convert("L")
-            text = pytesseract.image_to_string(img)
+            arr = np.array(img)
+            _, binary = cv2.threshold(arr, 0, 255,
+                                      cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            binary = cv2.bitwise_not(binary)
+            img = Image.fromarray(binary)
+            text = pytesseract.image_to_string(img, config="--psm 6")
             result = text.strip()
             if result:
                 self._log(f"[Alchemy] Test OCR: {result[:120]!r}", "info")
