@@ -48,7 +48,7 @@ except ImportError:
 # ==============================================================================
 # Version & update config
 # ==============================================================================
-APP_VERSION  = 3                          # bump this with every release
+APP_VERSION  = 4                          # bump this with every release
 GITHUB_REPO  = "LinKxFr/InvictusSROKP"   # used for update checks
 
 
@@ -478,7 +478,8 @@ class AlchemyEngine:
             img = ImageEnhance.Contrast(img).enhance(2.5)
             img = img.convert("L")   # greyscale
             return pytesseract.image_to_string(img)
-        except Exception:
+        except Exception as e:
+            self.log_cb(f"[Alchemy] OCR error: {e}")
             return ""
 
     def _loop(self):
@@ -492,16 +493,7 @@ class AlchemyEngine:
         _miss_count = 0
 
         while self.running:
-            # ── Stop-condition check (before clicking) ────────────────────
-            if use_ocr_stop:
-                ocr = self._ocr_region()
-                if self.stop_text in ocr.lower():
-                    self.log_cb("[Alchemy] Stop condition met — target reached!")
-                    self.running = False
-                    if self.stop_cb:
-                        self.stop_cb()
-                    break
-
+            # ── Click ─────────────────────────────────────────────────────
             if win32gui.GetForegroundWindow() == self.target_hwnd:
                 if use_template:
                     pos = find_on_screen(self.template_path)
@@ -521,7 +513,27 @@ class AlchemyEngine:
                     time.sleep(0.05)
                     ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)
 
-            time.sleep(self.delay_ms / 1000.0)
+            # ── Stop-condition check (2 s after click — result text appears then) ─
+            if use_ocr_stop and self.running:
+                time.sleep(2.0)
+                if not self.running:
+                    break
+                ocr = self._ocr_region()
+                if ocr.strip():
+                    self.log_cb(f"[Alchemy] OCR: {ocr.strip()[:80]!r}")
+                if self.stop_text.lower() in ocr.lower():
+                    self.log_cb("[Alchemy] Stop condition met — target reached!")
+                    self.running = False
+                    if self.stop_cb:
+                        self.stop_cb()
+                    break
+                # Wait out the rest of the delay (delay_ms already includes the 2 s)
+                remaining = (self.delay_ms / 1000.0) - 2.0
+                if remaining > 0 and self.running:
+                    time.sleep(remaining)
+            else:
+                time.sleep(self.delay_ms / 1000.0)
+
         self.log_cb("[Alchemy] Auto-clicker stopped.")
 
 
@@ -926,6 +938,12 @@ class KeyPresserApp(tk.Tk):
             fg=GREEN if has_rgn else FG2, bg=BG, font=("Segoe UI", 8))
         self._alchemy_region_lbl.pack(side="left")
 
+        tk.Button(row3, text="🔍 Test OCR",
+                  command=self._alchemy_test_ocr,
+                  bg=BG3, fg=FG2, activebackground=BORDER, activeforeground=FG,
+                  relief="flat", padx=6, pady=2, font=("Segoe UI", 8),
+                  cursor="hand2").pack(side="left", padx=(8, 0))
+
         if not _OCR_AVAILABLE:
             tk.Label(row3, text="  ⚠ pytesseract not installed",
                      fg=YELLOW, bg=BG, font=("Segoe UI", 7, "italic")).pack(side="left", padx=4)
@@ -1091,6 +1109,30 @@ class KeyPresserApp(tk.Tk):
             self._log(f"[Alchemy] Text region set ({w}×{h} px at {x},{y}).", "info")
 
         self._show_region_picker(_on_selected)
+
+    def _alchemy_test_ocr(self):
+        """Immediately screenshot the text region and log what OCR reads."""
+        region = self.config_data.get("alchemy_text_region")
+        if not region:
+            self._log("[Alchemy] No text region set — use 📷 Set Text Area first.", "warn")
+            return
+        if not _OCR_AVAILABLE or not _IMAGE_MATCHING:
+            self._log("[Alchemy] OCR not available (pytesseract / Pillow not installed).", "warn")
+            return
+        try:
+            x, y, w, h = region
+            img = ImageGrab.grab(bbox=(x, y, x + w, y + h))
+            img = img.resize((w * 2, h * 2))
+            img = ImageEnhance.Contrast(img).enhance(2.5)
+            img = img.convert("L")
+            text = pytesseract.image_to_string(img)
+            result = text.strip()
+            if result:
+                self._log(f"[Alchemy] Test OCR: {result[:120]!r}", "info")
+            else:
+                self._log("[Alchemy] Test OCR: (no text detected)", "warn")
+        except Exception as e:
+            self._log(f"[Alchemy] Test OCR error: {e}", "warn")
 
     def _add_timed_row(self, key: str = "", vk: int = 0,
                        hold_ms: int = 200, interval_min: int = 60,
