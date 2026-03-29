@@ -31,6 +31,14 @@ import win32api
 import psutil
 import keyboard
 
+try:
+    import cv2
+    from PIL import ImageGrab
+    import numpy as np
+    _IMAGE_MATCHING = True
+except ImportError:
+    _IMAGE_MATCHING = False
+
 # ==============================================================================
 # Version & update config
 # ==============================================================================
@@ -77,7 +85,8 @@ if not _is_admin():
 # --------------------------------------------------------------------------
 # Configuration file path — saved next to this script
 # --------------------------------------------------------------------------
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "keypresser_config.json")
+CONFIG_FILE           = os.path.join(os.path.dirname(os.path.abspath(__file__)), "keypresser_config.json")
+ALCHEMY_TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alchemy_template.png")
 
 # --------------------------------------------------------------------------
 # Default configuration
@@ -393,6 +402,32 @@ class TimedActionEngine:
 
 
 # ==============================================================================
+# Image-based screen search (OpenCV template matching)
+# ==============================================================================
+def find_on_screen(template_path: str, threshold: float = 0.7):
+    """
+    Locate `template_path` on the current screen using normalized cross-correlation.
+    Returns (center_x, center_y) in logical screen coordinates, or None if not found.
+    """
+    if not _IMAGE_MATCHING or not os.path.exists(template_path):
+        return None
+    try:
+        screenshot = np.array(ImageGrab.grab())
+        screen_gray = cv2.cvtColor(screenshot, cv2.COLOR_RGB2GRAY)
+        template = cv2.imread(template_path, cv2.IMREAD_GRAYSCALE)
+        if template is None:
+            return None
+        result = cv2.matchTemplate(screen_gray, template, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, max_loc = cv2.minMaxLoc(result)
+        if max_val >= threshold:
+            h, w = template.shape
+            return (max_loc[0] + w // 2, max_loc[1] + h // 2)
+    except Exception:
+        pass
+    return None
+
+
+# ==============================================================================
 # Alchemy auto-clicker engine
 # ==============================================================================
 class AlchemyEngine:
@@ -401,11 +436,13 @@ class AlchemyEngine:
     Only clicks when the target window is in the foreground.
     """
 
-    def __init__(self, target_hwnd: int, delay_ms: int, log_cb):
-        self.target_hwnd = target_hwnd
-        self.delay_ms    = max(100, delay_ms)
-        self.log_cb      = log_cb
-        self.running     = False
+    def __init__(self, target_hwnd: int, delay_ms: int, log_cb,
+                 template_path: str = ""):
+        self.target_hwnd   = target_hwnd
+        self.delay_ms      = max(100, delay_ms)
+        self.log_cb        = log_cb
+        self.template_path = template_path
+        self.running       = False
         self._thread: threading.Thread | None = None
 
     def start(self):
@@ -417,13 +454,33 @@ class AlchemyEngine:
         self.running = False
 
     def _loop(self):
-        self.log_cb("[Alchemy] Auto-clicker started.")
+        use_template = bool(self.template_path and os.path.exists(self.template_path)
+                            and _IMAGE_MATCHING)
+        mode = "image targeting" if use_template else "cursor position"
+        self.log_cb(f"[Alchemy] Auto-clicker started ({mode}).")
+        _miss_count = 0
+
         while self.running:
             if win32gui.GetForegroundWindow() == self.target_hwnd:
-                # MOUSEEVENTF_LEFTDOWN = 0x0002, MOUSEEVENTF_LEFTUP = 0x0004
-                ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)
-                time.sleep(0.05)
-                ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)
+                if use_template:
+                    pos = find_on_screen(self.template_path)
+                    if pos:
+                        _miss_count = 0
+                        # Move cursor to the button, then click
+                        ctypes.windll.user32.SetCursorPos(pos[0], pos[1])
+                        time.sleep(0.05)
+                        ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)
+                        time.sleep(0.05)
+                        ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)
+                    else:
+                        _miss_count += 1
+                        if _miss_count % 5 == 1:
+                            self.log_cb("[Alchemy] Fuse button not found on screen…")
+                else:
+                    # No template — click wherever the cursor already is
+                    ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)
+                    time.sleep(0.05)
+                    ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)
             time.sleep(self.delay_ms / 1000.0)
         self.log_cb("[Alchemy] Auto-clicker stopped.")
 
@@ -786,6 +843,25 @@ class KeyPresserApp(tk.Tk):
         tk.Label(row, textvariable=self._alchemy_status_var,
                  fg=FG2, bg=BG, font=("Segoe UI", 9)).pack(side="left")
 
+        # ── Second row: image targeting ───────────────────────────────────
+        row2 = tk.Frame(outer, bg=BG)
+        row2.pack(fill="x", padx=10, pady=(0, 8))
+
+        tk.Button(row2, text="📷 Set Fuse",
+                  command=self._alchemy_capture_template,
+                  bg=BG3, fg="#fab387", activebackground=BORDER, activeforeground=FG,
+                  relief="flat", padx=8, pady=2, font=("Segoe UI", 8),
+                  cursor="hand2").pack(side="left")
+        tk.Label(row2, text="  Hover over the Fuse button, then click — 3s countdown",
+                 fg=FG2, bg=BG, font=("Segoe UI", 7, "italic")).pack(side="left", padx=4)
+
+        has_tpl = os.path.exists(ALCHEMY_TEMPLATE_PATH)
+        self._alchemy_template_lbl = tk.Label(
+            row2,
+            text="✓ Template set" if has_tpl else "No template — clicking at cursor",
+            fg=GREEN if has_tpl else FG2, bg=BG, font=("Segoe UI", 8))
+        self._alchemy_template_lbl.pack(side="right", padx=4)
+
     def toggle_alchemy(self):
         if self._alchemy_engine and self._alchemy_engine.running:
             self.stop_alchemy()
@@ -803,6 +879,7 @@ class KeyPresserApp(tk.Tk):
             target_hwnd=self._target_hwnd,
             delay_ms=delay_ms,
             log_cb=lambda msg: self._log(msg, "info"),
+            template_path=ALCHEMY_TEMPLATE_PATH,
         )
         self._alchemy_engine.start()
         self._alchemy_btn.config(text="■ Stop")
@@ -814,6 +891,46 @@ class KeyPresserApp(tk.Tk):
             self._alchemy_engine = None
         self._alchemy_btn.config(text="▶ Start")
         self._alchemy_status_var.set("● Idle")
+
+    def _alchemy_capture_template(self):
+        if self._alchemy_engine and self._alchemy_engine.running:
+            messagebox.showwarning("Alchemy Running",
+                                   "Stop the auto-clicker before capturing a new template.")
+            return
+        if not _IMAGE_MATCHING:
+            messagebox.showerror("Missing Libraries",
+                "Install Pillow, numpy, and opencv-python to use image targeting:\n"
+                "  pip install Pillow numpy opencv-python")
+            return
+
+        self._log("[Alchemy] Minimizing in 1 s — hover over the Fuse button. Capturing in 3 s…", "info")
+
+        def _do_capture():
+            time.sleep(1.0)
+            self.after(0, self.iconify)   # minimize the app
+            time.sleep(3.0)
+
+            # Cursor position in logical pixels
+            class _PT(ctypes.Structure):
+                _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+            pt = _PT()
+            ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+            cx, cy = pt.x, pt.y
+
+            # Grab full screen and crop a 120 × 40 px region around the cursor
+            screenshot = ImageGrab.grab()
+            half_w, half_h = 60, 20
+            box = (max(0, cx - half_w), max(0, cy - half_h),
+                   cx + half_w,         cy + half_h)
+            cropped = screenshot.crop(box)
+            cropped.save(ALCHEMY_TEMPLATE_PATH)
+
+            self.after(0, self.deiconify)
+            self.after(0, lambda: self._alchemy_template_lbl.config(
+                text="✓ Template set", fg=GREEN))
+            self.after(0, lambda: self._log("[Alchemy] Fuse button template saved.", "info"))
+
+        threading.Thread(target=_do_capture, daemon=True).start()
 
     def _add_timed_row(self, key: str = "", vk: int = 0,
                        hold_ms: int = 200, interval_min: int = 60,
