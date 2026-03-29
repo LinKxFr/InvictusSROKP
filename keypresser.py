@@ -17,6 +17,7 @@ from tkinter import ttk, messagebox
 import json
 import os
 import sys
+import re
 import ctypes
 import time
 import threading
@@ -48,7 +49,7 @@ except ImportError:
 # ==============================================================================
 # Version & update config
 # ==============================================================================
-APP_VERSION  = 4                          # bump this with every release
+APP_VERSION  = 5                          # bump this with every release
 GITHUB_REPO  = "LinKxFr/InvictusSROKP"   # used for update checks
 
 
@@ -456,6 +457,7 @@ class AlchemyEngine:
         self.stop_text    = stop_text.strip().lower()
         self.stop_cb      = stop_cb       # called (no args) when stop condition met
         self.running      = False
+        self._last_level: int | None = None   # tracks last logged alchemy level
         self._thread: threading.Thread | None = None
 
     def start(self):
@@ -519,7 +521,15 @@ class AlchemyEngine:
                 if not self.running:
                     break
                 ocr = self._ocr_region()
-                if ocr.strip():
+                # ── Progressive level logging ─────────────────────────────
+                m = re.search(r'\[(\d+)\]', ocr, re.IGNORECASE)
+                if m:
+                    level = int(m.group(1))
+                    if level != self._last_level:
+                        self._last_level = level
+                        self.log_cb(f"[Alchemy] ★ Level {level} reached!")
+                elif ocr.strip():
+                    # No level pattern — show raw OCR for debugging
                     self.log_cb(f"[Alchemy] OCR: {ocr.strip()[:80]!r}")
                 if self.stop_text.lower() in ocr.lower():
                     self.log_cb("[Alchemy] Stop condition met — target reached!")
@@ -688,22 +698,14 @@ class KeyPresserApp(tk.Tk):
         inner_ctrl = tk.Frame(ctrl_frame, bg=BG)
         inner_ctrl.pack(fill="x", padx=10, pady=6)
 
-        # Start / Stop buttons
-        self._btn_start = tk.Button(inner_ctrl, text="▶ Start",
-                                    command=self.start_pressing,
-                                    bg=GREEN, fg="#1e1e2e", activebackground="#80c880",
-                                    activeforeground="#1e1e2e", relief="flat",
-                                    font=("Segoe UI", 9, "bold"), padx=10, pady=4,
-                                    cursor="hand2")
-        self._btn_start.pack(side="left", padx=(0, 4))
-
-        self._btn_stop = tk.Button(inner_ctrl, text="■ Stop",
-                                   command=self.stop_pressing,
-                                   bg=RED, fg="#1e1e2e", activebackground="#d06070",
-                                   activeforeground="#1e1e2e", relief="flat",
-                                   font=("Segoe UI", 9, "bold"), padx=10, pady=4,
-                                   cursor="hand2", state="disabled")
-        self._btn_stop.pack(side="left", padx=(0, 6))
+        # Toggle Start / Stop button (single button, like Alchemy)
+        self._btn_seq = tk.Button(inner_ctrl, text="▶ Start",
+                                  command=self.toggle_pressing,
+                                  bg=GREEN, fg="#1e1e2e", activebackground="#80c880",
+                                  activeforeground="#1e1e2e", relief="flat",
+                                  font=("Segoe UI", 9, "bold"), padx=10, pady=4,
+                                  cursor="hand2")
+        self._btn_seq.pack(side="left", padx=(0, 6))
 
         self._status_var = tk.StringVar(value="● Idle")
         self._status_lbl = tk.Label(inner_ctrl, textvariable=self._status_var,
@@ -714,18 +716,11 @@ class KeyPresserApp(tk.Tk):
         tk.Label(inner_ctrl, text="│", fg=BORDER, bg=BG,
                  font=("Segoe UI", 12)).pack(side="left", padx=(0, 8))
 
-        # Hotkeys inline
-        tk.Label(inner_ctrl, text="Start:", fg=FG2, bg=BG,
+        # Hotkeys inline — single toggle key
+        tk.Label(inner_ctrl, text="Toggle:", fg=FG2, bg=BG,
                  font=("Segoe UI", 8)).pack(side="left")
         self._hk_start_var = tk.StringVar(value=self.config_data.get("hotkey_start", "F6"))
         tk.Entry(inner_ctrl, textvariable=self._hk_start_var, width=5, bg=BG3, fg=ACCENT,
-                 insertbackground=FG, relief="flat",
-                 font=("Consolas", 8)).pack(side="left", padx=(3, 8))
-
-        tk.Label(inner_ctrl, text="Stop:", fg=FG2, bg=BG,
-                 font=("Segoe UI", 8)).pack(side="left")
-        self._hk_stop_var = tk.StringVar(value=self.config_data.get("hotkey_stop", "F7"))
-        tk.Entry(inner_ctrl, textvariable=self._hk_stop_var, width=5, bg=BG3, fg=ACCENT,
                  insertbackground=FG, relief="flat",
                  font=("Consolas", 8)).pack(side="left", padx=(3, 8))
 
@@ -1610,8 +1605,14 @@ class KeyPresserApp(tk.Tk):
         self._log(f"Target: {label}  (hwnd={hwnd})", "info")
 
     # ======================================================================
-    # Sequence start / stop
+    # Sequence start / stop / toggle
     # ======================================================================
+    def toggle_pressing(self):
+        if self.engine and self.engine.running:
+            self.stop_pressing()
+        else:
+            self.start_pressing()
+
     def start_pressing(self):
         if not self._target_hwnd:
             messagebox.showwarning("No Target", "Please select a target window first.")
@@ -1630,8 +1631,7 @@ class KeyPresserApp(tk.Tk):
             log_cb=lambda msg: self._log(msg, _classify(msg))
         )
         self.engine.start()
-        self._btn_start.config(state="disabled")
-        self._btn_stop.config(state="normal")
+        self._btn_seq.config(text="■ Stop", bg=RED, activebackground="#d06070")
         self._status_var.set("● Running")
         self._status_lbl.config(fg=GREEN)
         self._log("Sequence STARTED.", "info")
@@ -1640,8 +1640,7 @@ class KeyPresserApp(tk.Tk):
         if self.engine:
             self.engine.stop()
             self.engine = None
-        self._btn_start.config(state="normal")
-        self._btn_stop.config(state="disabled")
+        self._btn_seq.config(text="▶ Start", bg=GREEN, activebackground="#80c880")
         self._status_var.set("● Idle")
         self._status_lbl.config(fg=FG2)
         self._log("Sequence STOPPED.", "info")
@@ -1654,16 +1653,14 @@ class KeyPresserApp(tk.Tk):
             keyboard.unhook_all_hotkeys()
         except Exception:
             pass
-        start_key   = self._hk_start_var.get().strip()
-        stop_key    = self._hk_stop_var.get().strip()
+        toggle_key  = self._hk_start_var.get().strip()
         alchemy_key = self._alchemy_hk_var.get().strip()
         try:
-            keyboard.add_hotkey(start_key,   self.start_pressing,  suppress=False)
-            keyboard.add_hotkey(stop_key,    self.stop_pressing,   suppress=False)
+            keyboard.add_hotkey(toggle_key, self.toggle_pressing, suppress=False)
             if alchemy_key:
                 keyboard.add_hotkey(alchemy_key, self.toggle_alchemy, suppress=False)
             self._log(
-                f"Hotkeys: Start={start_key}  Stop={stop_key}  Alchemy={alchemy_key or '—'}",
+                f"Hotkeys: Seq Toggle={toggle_key}  Alchemy={alchemy_key or '—'}",
                 "info")
         except Exception as e:
             self._log(f"Hotkey registration failed: {e}", "error")
@@ -1712,7 +1709,6 @@ class KeyPresserApp(tk.Tk):
             "sequence":          self._collect_sequence(),
             "timed_actions":     self._collect_timed_actions(),
             "hotkey_start":      self._hk_start_var.get().strip(),
-            "hotkey_stop":       self._hk_stop_var.get().strip(),
             "target_window":     self.window_combo.get(),
             "prefocus_sec":      max(1, self._prefocus_var.get()),
             "alchemy_delay_ms":   max(100, self._alchemy_delay_var.get()),
