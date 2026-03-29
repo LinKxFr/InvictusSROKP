@@ -33,7 +33,7 @@ import keyboard
 
 try:
     import cv2
-    from PIL import ImageGrab, ImageEnhance
+    from PIL import ImageGrab, ImageEnhance, ImageTk
     import numpy as np
     _IMAGE_MATCHING = True
 except ImportError:
@@ -892,7 +892,7 @@ class KeyPresserApp(tk.Tk):
                   bg=BG3, fg="#fab387", activebackground=BORDER, activeforeground=FG,
                   relief="flat", padx=8, pady=2, font=("Segoe UI", 8),
                   cursor="hand2").pack(side="left")
-        tk.Label(row2, text="  Hover over the Fuse button — 3s countdown",
+        tk.Label(row2, text="  Draw a rectangle around the Fuse button",
                  fg=FG2, bg=BG, font=("Segoe UI", 7, "italic")).pack(side="left", padx=4)
 
         has_tpl = os.path.exists(ALCHEMY_TEMPLATE_PATH)
@@ -963,84 +963,134 @@ class KeyPresserApp(tk.Tk):
         self._alchemy_btn.config(text="▶ Start")
         self._alchemy_status_var.set("● Idle")
 
+    # ── Shared snipping-tool overlay ──────────────────────────────────────
+    def _show_region_picker(self, callback):
+        """
+        Minimise the app, grab a screenshot, then show a full-screen canvas
+        where the user drags to select a rectangle.
+        callback(x, y, w, h, screenshot) is called on the main thread.
+        """
+        if not _IMAGE_MATCHING:
+            messagebox.showerror("Missing Libraries",
+                "Install Pillow, numpy, and opencv-python:\n"
+                "  pip install Pillow numpy opencv-python")
+            return
+        self.iconify()
+        self.after(250, lambda: self._open_picker_overlay(callback))
+
+    def _open_picker_overlay(self, callback):
+        screenshot = ImageGrab.grab()
+        sw, sh = screenshot.size
+
+        top = tk.Toplevel(self)
+        top.overrideredirect(True)
+        top.geometry(f"{sw}x{sh}+0+0")
+        top.attributes('-topmost', True)
+
+        photo = ImageTk.PhotoImage(screenshot)
+        canvas = tk.Canvas(top, width=sw, height=sh, cursor='crosshair',
+                           highlightthickness=0, bd=0)
+        canvas.pack(fill='both', expand=True)
+        canvas.create_image(0, 0, anchor='nw', image=photo)
+        canvas.image = photo   # keep reference
+
+        DIM, SEL, HINT, SZ = 'dim', 'sel', 'hint', 'sz'
+
+        def _redraw_dim(x0=0, y0=0, x1=sw, y1=sh):
+            """Draw dim overlay as 4 rectangles with the selection area clear."""
+            canvas.delete(DIM)
+            for rx0, ry0, rx1, ry1 in [
+                (0,  0,   sw,  y0),   # top
+                (0,  y1,  sw,  sh),   # bottom
+                (0,  y0,  x0,  y1),   # left
+                (x1, y0,  sw,  y1),   # right
+            ]:
+                if rx1 > rx0 and ry1 > ry0:
+                    canvas.create_rectangle(rx0, ry0, rx1, ry1,
+                                            fill='black', stipple='gray50',
+                                            outline='', tags=DIM)
+
+        _redraw_dim()   # full-screen dim before first drag
+        canvas.create_text(sw // 2, sh // 2,
+                           text='Drag to select   •   ESC to cancel',
+                           fill='white', font=('Segoe UI', 16, 'bold'), tags=HINT)
+
+        start = [0, 0]
+
+        def on_press(e):
+            start[0], start[1] = e.x, e.y
+            canvas.delete(HINT)
+            canvas.delete(SEL)
+            canvas.delete(SZ)
+
+        def on_drag(e):
+            x0, y0 = min(start[0], e.x), min(start[1], e.y)
+            x1, y1 = max(start[0], e.x), max(start[1], e.y)
+            _redraw_dim(x0, y0, x1, y1)
+            canvas.delete(SEL)
+            canvas.create_rectangle(x0, y0, x1, y1,
+                                    outline='#00ff88', width=2, tags=SEL)
+            canvas.delete(SZ)
+            label_y = max(y0 - 16, 12)
+            canvas.create_text(x0 + (x1 - x0) // 2, label_y,
+                                text=f'{x1 - x0} × {y1 - y0} px',
+                                fill='#00ff88', font=('Consolas', 9, 'bold'), tags=SZ)
+
+        def on_release(e):
+            x0 = min(start[0], e.x)
+            y0 = min(start[1], e.y)
+            x1 = max(start[0], e.x)
+            y1 = max(start[1], e.y)
+            top.destroy()
+            self.deiconify()
+            if x1 - x0 > 5 and y1 - y0 > 5:
+                self.after(0, lambda: callback(x0, y0, x1 - x0, y1 - y0, screenshot))
+            else:
+                self._log("[Alchemy] Region selection too small — cancelled.", "warn")
+
+        def on_escape(e):
+            top.destroy()
+            self.deiconify()
+            self._log("[Alchemy] Region selection cancelled.", "info")
+
+        canvas.bind('<ButtonPress-1>',   on_press)
+        canvas.bind('<B1-Motion>',       on_drag)
+        canvas.bind('<ButtonRelease-1>', on_release)
+        top.bind('<Escape>',             on_escape)
+        top.focus_force()
+
     def _alchemy_capture_template(self):
         if self._alchemy_engine and self._alchemy_engine.running:
             messagebox.showwarning("Alchemy Running",
                                    "Stop the auto-clicker before capturing a new template.")
             return
-        if not _IMAGE_MATCHING:
-            messagebox.showerror("Missing Libraries",
-                "Install Pillow, numpy, and opencv-python to use image targeting:\n"
-                "  pip install Pillow numpy opencv-python")
-            return
 
-        self._log("[Alchemy] Minimizing in 1 s — hover over the Fuse button. Capturing in 3 s…", "info")
-
-        def _do_capture():
-            time.sleep(1.0)
-            self.after(0, self.iconify)   # minimize the app
-            time.sleep(3.0)
-
-            # Cursor position in logical pixels
-            class _PT(ctypes.Structure):
-                _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
-            pt = _PT()
-            ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
-            cx, cy = pt.x, pt.y
-
-            # Grab full screen and crop a 120 × 40 px region around the cursor
-            screenshot = ImageGrab.grab()
-            half_w, half_h = 60, 20
-            box = (max(0, cx - half_w), max(0, cy - half_h),
-                   cx + half_w,         cy + half_h)
-            cropped = screenshot.crop(box)
+        def _on_selected(x, y, w, h, screenshot):
+            cropped = screenshot.crop((x, y, x + w, y + h))
             cropped.save(ALCHEMY_TEMPLATE_PATH)
+            self._alchemy_template_lbl.config(text="✓ Template set", fg=GREEN)
+            self._log(f"[Alchemy] Fuse template saved ({w}×{h} px).", "info")
 
-            self.after(0, self.deiconify)
-            self.after(0, lambda: self._alchemy_template_lbl.config(
-                text="✓ Template set", fg=GREEN))
-            self.after(0, lambda: self._log("[Alchemy] Fuse button template saved.", "info"))
-
-        threading.Thread(target=_do_capture, daemon=True).start()
+        self._show_region_picker(_on_selected)
 
     def _alchemy_capture_text_region(self):
-        """3-second countdown, then saves the cursor position as the OCR text region."""
         if self._alchemy_engine and self._alchemy_engine.running:
             messagebox.showwarning("Alchemy Running",
                                    "Stop the auto-clicker before changing the text region.")
             return
         if not _OCR_AVAILABLE:
             messagebox.showerror("pytesseract not installed",
-                "Install pytesseract and Tesseract OCR to use the stop condition:\n"
+                "Install pytesseract + Tesseract OCR to use the stop condition:\n"
                 "  1. pip install pytesseract\n"
-                "  2. Download Tesseract: https://github.com/UB-Mannheim/tesseract/wiki")
+                "  2. https://github.com/UB-Mannheim/tesseract/wiki")
             return
 
-        self._log("[Alchemy] Minimizing in 1 s — hover over the success text area. Capturing in 3 s…", "info")
+        def _on_selected(x, y, w, h, screenshot):
+            self.config_data["alchemy_text_region"] = [x, y, w, h]
+            self._alchemy_region_lbl.config(text="✓ Region set", fg=GREEN)
+            self._log(f"[Alchemy] Text region set ({w}×{h} px at {x},{y}).", "info")
 
-        def _do_capture():
-            time.sleep(1.0)
-            self.after(0, self.iconify)
-            time.sleep(3.0)
-
-            class _PT(ctypes.Structure):
-                _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
-            pt = _PT()
-            ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
-            cx, cy = pt.x, pt.y
-
-            # 500 × 100 px region centered on cursor — covers several chat lines
-            w, h = 500, 100
-            region = [max(0, cx - w // 2), max(0, cy - h // 2), w, h]
-
-            self.config_data["alchemy_text_region"] = region
-            self.after(0, self.deiconify)
-            self.after(0, lambda: self._alchemy_region_lbl.config(
-                text="✓ Region set", fg=GREEN))
-            self.after(0, lambda: self._log(
-                f"[Alchemy] Text region set to {region}.", "info"))
-
-        threading.Thread(target=_do_capture, daemon=True).start()
+        self._show_region_picker(_on_selected)
 
     def _add_timed_row(self, key: str = "", vk: int = 0,
                        hold_ms: int = 200, interval_min: int = 60,
