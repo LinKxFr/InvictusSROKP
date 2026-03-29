@@ -50,7 +50,7 @@ except ImportError:
 # ==============================================================================
 # Version & update config
 # ==============================================================================
-APP_VERSION  = 7                          # bump this with every release
+APP_VERSION  = 8                          # bump this with every release
 GITHUB_REPO  = "LinKxFr/InvictusSROKP"   # used for update checks
 
 
@@ -478,18 +478,28 @@ class AlchemyEngine:
             img = ImageGrab.grab(bbox=(x, y, x + w, y + h))
             # 3× upscale with high-quality resampling for better glyph detail
             img = img.resize((w * 3, h * 3), resample=Image.LANCZOS)
-            img = img.convert("L")                       # greyscale
-            # Otsu binarization — finds optimal threshold automatically,
-            # much cleaner than a fixed contrast boost for game UI fonts
-            arr = np.array(img)
-            _, binary = cv2.threshold(arr, 0, 255,
-                                      cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            # Invert: game text is light on dark bg;
-            # Tesseract works best with dark text on white background
-            binary = cv2.bitwise_not(binary)
-            img = Image.fromarray(binary)
-            # PSM 6 = assume a uniform block of text (best for chat-line regions)
-            return pytesseract.image_to_string(img, config="--psm 6")
+            arr = np.array(img)                          # RGB
+            # ── Color-based isolation ────────────────────────────────────────
+            # The font/colour is fixed; only the background varies.
+            # Work in HSV so brightness and hue can be targeted independently.
+            hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
+            # White / near-white text  (any hue, low saturation, high value)
+            mask_white = cv2.inRange(hsv,
+                                     np.array([  0,  0, 160]),
+                                     np.array([180, 55, 255]))
+            # Golden / yellow text  (common SRO success & system-message colour)
+            mask_gold  = cv2.inRange(hsv,
+                                     np.array([ 15, 100, 150]),
+                                     np.array([ 35, 255, 255]))
+            mask = cv2.bitwise_or(mask_white, mask_gold)
+            # Small dilation fills gaps in thin game-font strokes
+            kernel = np.ones((2, 2), np.uint8)
+            mask = cv2.dilate(mask, kernel, iterations=1)
+            # Invert → dark text on white background (Tesseract's preference)
+            result = cv2.bitwise_not(mask)
+            img = Image.fromarray(result)
+            # PSM 6 = uniform text block; OEM 3 = best available engine
+            return pytesseract.image_to_string(img, config="--psm 6 --oem 3")
         except Exception as e:
             self.log_cb(f"[Alchemy] OCR error: {e}")
             return ""
@@ -1128,13 +1138,20 @@ class KeyPresserApp(tk.Tk):
             x, y, w, h = region
             img = ImageGrab.grab(bbox=(x, y, x + w, y + h))
             img = img.resize((w * 3, h * 3), resample=Image.LANCZOS)
-            img = img.convert("L")
             arr = np.array(img)
-            _, binary = cv2.threshold(arr, 0, 255,
-                                      cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            binary = cv2.bitwise_not(binary)
-            img = Image.fromarray(binary)
-            text = pytesseract.image_to_string(img, config="--psm 6")
+            hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
+            mask_white = cv2.inRange(hsv,
+                                     np.array([  0,  0, 160]),
+                                     np.array([180, 55, 255]))
+            mask_gold  = cv2.inRange(hsv,
+                                     np.array([ 15, 100, 150]),
+                                     np.array([ 35, 255, 255]))
+            mask = cv2.bitwise_or(mask_white, mask_gold)
+            kernel = np.ones((2, 2), np.uint8)
+            mask = cv2.dilate(mask, kernel, iterations=1)
+            result_arr = cv2.bitwise_not(mask)
+            img = Image.fromarray(result_arr)
+            text = pytesseract.image_to_string(img, config="--psm 6 --oem 3")
             result = text.strip()
             if result:
                 self._log(f"[Alchemy] Test OCR: {result[:120]!r}", "info")
