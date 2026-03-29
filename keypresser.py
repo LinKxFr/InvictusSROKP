@@ -101,6 +101,8 @@ DEFAULT_CONFIG = {
     "hotkey_start": "F6",
     "hotkey_stop":  "F7",
     "target_window": "",
+    "alchemy_delay_ms": 500,
+    "alchemy_hotkey":   "F8",
 }
 
 # --------------------------------------------------------------------------
@@ -391,6 +393,42 @@ class TimedActionEngine:
 
 
 # ==============================================================================
+# Alchemy auto-clicker engine
+# ==============================================================================
+class AlchemyEngine:
+    """
+    Sends left mouse clicks at a fixed interval for as long as `running` is True.
+    Only clicks when the target window is in the foreground.
+    """
+
+    def __init__(self, target_hwnd: int, delay_ms: int, log_cb):
+        self.target_hwnd = target_hwnd
+        self.delay_ms    = max(100, delay_ms)
+        self.log_cb      = log_cb
+        self.running     = False
+        self._thread: threading.Thread | None = None
+
+    def start(self):
+        self.running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self.running = False
+
+    def _loop(self):
+        self.log_cb("[Alchemy] Auto-clicker started.")
+        while self.running:
+            if win32gui.GetForegroundWindow() == self.target_hwnd:
+                # MOUSEEVENTF_LEFTDOWN = 0x0002, MOUSEEVENTF_LEFTUP = 0x0004
+                ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)
+                time.sleep(0.05)
+                ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)
+            time.sleep(self.delay_ms / 1000.0)
+        self.log_cb("[Alchemy] Auto-clicker stopped.")
+
+
+# ==============================================================================
 # Main Application Window
 # ==============================================================================
 class KeyPresserApp(tk.Tk):
@@ -407,11 +445,12 @@ class KeyPresserApp(tk.Tk):
         self.config_data = self._load_config()
         self.engine: KeyPressEngine | None = None
 
-        self._target_hwnd  = 0
-        self._window_map   = {}
-        self._seq_rows     = []   # (key_var, vk_var, delay_var, frame)
-        self._timed_rows   = []   # list of row-dicts (see _add_timed_row)
-        self._capturing    = False
+        self._target_hwnd   = 0
+        self._window_map    = {}
+        self._seq_rows      = []   # (key_var, vk_var, delay_var, frame)
+        self._timed_rows    = []   # list of row-dicts (see _add_timed_row)
+        self._capturing     = False
+        self._alchemy_engine: AlchemyEngine | None = None
 
         self._build_ui()
         self._populate_window_list()
@@ -595,6 +634,9 @@ class KeyPresserApp(tk.Tk):
         # ── Timed Actions ──────────────────────────────────────────────────
         self._build_timed_section()
 
+        # ── Alchemy (Auto-Clicker) ─────────────────────────────────────────
+        self._build_alchemy_section()
+
         # ── Log console ────────────────────────────────────────────────────
         log_frame = tk.LabelFrame(sf, text=" Event Log ", font=("Segoe UI", 9),
                                   fg=ACCENT, bg=BG, bd=1, relief="solid")
@@ -692,6 +734,86 @@ class KeyPresserApp(tk.Tk):
         self._timed_status_lbl = tk.Label(ctrl, text="● Idle",
                                           fg=RED, bg=BG, font=("Segoe UI", 8, "bold"))
         self._timed_status_lbl.pack(side="right", padx=4)
+
+    # ======================================================================
+    # Alchemy section
+    # ======================================================================
+    def _build_alchemy_section(self):
+        outer = tk.LabelFrame(self._sf, text=" Alchemy  (Auto Left-Clicker) ",
+                              font=("Segoe UI", 9), fg="#fab387", bg=BG, bd=1, relief="solid")
+        outer.pack(fill="x", padx=12, pady=4)
+
+        row = tk.Frame(outer, bg=BG)
+        row.pack(fill="x", padx=10, pady=8)
+
+        # Delay
+        tk.Label(row, text="Delay (ms):", fg=FG2, bg=BG,
+                 font=("Segoe UI", 9)).pack(side="left")
+        _vcmd = (self.register(lambda s: s.isdigit() or s == ''), '%P')
+        self._alchemy_delay_var = tk.IntVar(
+            value=self.config_data.get("alchemy_delay_ms", 500))
+        tk.Spinbox(row, from_=100, to=99999, textvariable=self._alchemy_delay_var,
+                   width=6, bg=BG3, fg=FG, insertbackground=FG, buttonbackground=BG3,
+                   relief="flat", font=("Consolas", 9),
+                   validate='key', validatecommand=_vcmd
+                   ).pack(side="left", padx=(4, 16))
+
+        # Toggle hotkey
+        tk.Label(row, text="Toggle key:", fg=FG2, bg=BG,
+                 font=("Segoe UI", 9)).pack(side="left")
+        self._alchemy_hk_var = tk.StringVar(
+            value=self.config_data.get("alchemy_hotkey", "F8"))
+        tk.Entry(row, textvariable=self._alchemy_hk_var, width=5,
+                 bg=BG3, fg=ACCENT, insertbackground=FG, relief="flat",
+                 font=("Consolas", 9)).pack(side="left", padx=(4, 4))
+        tk.Button(row, text="Apply", command=self._register_hotkeys,
+                  bg=BG3, fg=YELLOW, activebackground=BORDER, activeforeground=FG,
+                  relief="flat", padx=6, pady=2, font=("Segoe UI", 8),
+                  cursor="hand2").pack(side="left", padx=(0, 16))
+
+        # Start / Stop toggle button
+        self._alchemy_btn = tk.Button(row, text="▶ Start",
+                                      command=self.toggle_alchemy,
+                                      bg="#fab387", fg="#1e1e2e",
+                                      activebackground="#fcd9c4",
+                                      activeforeground="#1e1e2e",
+                                      relief="flat", font=("Segoe UI", 9, "bold"),
+                                      padx=10, pady=4, cursor="hand2")
+        self._alchemy_btn.pack(side="left", padx=(0, 8))
+
+        # Status label
+        self._alchemy_status_var = tk.StringVar(value="● Idle")
+        tk.Label(row, textvariable=self._alchemy_status_var,
+                 fg=FG2, bg=BG, font=("Segoe UI", 9)).pack(side="left")
+
+    def toggle_alchemy(self):
+        if self._alchemy_engine and self._alchemy_engine.running:
+            self.stop_alchemy()
+        else:
+            self.start_alchemy()
+
+    def start_alchemy(self):
+        if not self._target_hwnd:
+            messagebox.showwarning("No Target", "Please select a target window first.")
+            return
+        if self._alchemy_engine and self._alchemy_engine.running:
+            return
+        delay_ms = max(100, self._alchemy_delay_var.get())
+        self._alchemy_engine = AlchemyEngine(
+            target_hwnd=self._target_hwnd,
+            delay_ms=delay_ms,
+            log_cb=lambda msg: self._log(msg, "info"),
+        )
+        self._alchemy_engine.start()
+        self._alchemy_btn.config(text="■ Stop")
+        self._alchemy_status_var.set("● Running")
+
+    def stop_alchemy(self):
+        if self._alchemy_engine:
+            self._alchemy_engine.stop()
+            self._alchemy_engine = None
+        self._alchemy_btn.config(text="▶ Start")
+        self._alchemy_status_var.set("● Idle")
 
     def _add_timed_row(self, key: str = "", vk: int = 0,
                        hold_ms: int = 200, interval_min: int = 60,
@@ -1213,12 +1335,17 @@ class KeyPresserApp(tk.Tk):
             keyboard.unhook_all_hotkeys()
         except Exception:
             pass
-        start_key = self._hk_start_var.get().strip()
-        stop_key  = self._hk_stop_var.get().strip()
+        start_key   = self._hk_start_var.get().strip()
+        stop_key    = self._hk_stop_var.get().strip()
+        alchemy_key = self._alchemy_hk_var.get().strip()
         try:
-            keyboard.add_hotkey(start_key, self.start_pressing, suppress=False)
-            keyboard.add_hotkey(stop_key,  self.stop_pressing,  suppress=False)
-            self._log(f"Hotkeys: Start={start_key}  Stop={stop_key}", "info")
+            keyboard.add_hotkey(start_key,   self.start_pressing,  suppress=False)
+            keyboard.add_hotkey(stop_key,    self.stop_pressing,   suppress=False)
+            if alchemy_key:
+                keyboard.add_hotkey(alchemy_key, self.toggle_alchemy, suppress=False)
+            self._log(
+                f"Hotkeys: Start={start_key}  Stop={stop_key}  Alchemy={alchemy_key or '—'}",
+                "info")
         except Exception as e:
             self._log(f"Hotkey registration failed: {e}", "error")
 
@@ -1263,12 +1390,14 @@ class KeyPresserApp(tk.Tk):
 
     def save_config(self):
         cfg = {
-            "sequence":       self._collect_sequence(),
-            "timed_actions":  self._collect_timed_actions(),
-            "hotkey_start":   self._hk_start_var.get().strip(),
-            "hotkey_stop":    self._hk_stop_var.get().strip(),
-            "target_window":  self.window_combo.get(),
-            "prefocus_sec":   max(1, self._prefocus_var.get()),
+            "sequence":          self._collect_sequence(),
+            "timed_actions":     self._collect_timed_actions(),
+            "hotkey_start":      self._hk_start_var.get().strip(),
+            "hotkey_stop":       self._hk_stop_var.get().strip(),
+            "target_window":     self.window_combo.get(),
+            "prefocus_sec":      max(1, self._prefocus_var.get()),
+            "alchemy_delay_ms":  max(100, self._alchemy_delay_var.get()),
+            "alchemy_hotkey":    self._alchemy_hk_var.get().strip(),
         }
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
