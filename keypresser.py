@@ -50,7 +50,7 @@ except ImportError:
 # ==============================================================================
 # Version & update config
 # ==============================================================================
-APP_VERSION  = 9                          # bump this with every release
+APP_VERSION  = 10                         # bump this with every release
 GITHUB_REPO  = "LinKxFr/InvictusSROKP"   # used for update checks
 
 
@@ -91,10 +91,19 @@ if not _is_admin():
         sys.exit(1)
 
 # --------------------------------------------------------------------------
-# Configuration file path — saved next to this script
+# Configuration file path — saved next to the exe (or script when run directly)
 # --------------------------------------------------------------------------
-CONFIG_FILE           = os.path.join(os.path.dirname(os.path.abspath(__file__)), "keypresser_config.json")
-ALCHEMY_TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alchemy_template.png")
+# sys.frozen is set by PyInstaller; sys.executable is the .exe path.
+# Without this check, __file__ resolves to the PyInstaller temp-extract dir
+# (e.g. _MEI12345\) which is deleted on exit — configs and templates would
+# never persist between runs.
+if getattr(sys, 'frozen', False):
+    _BASE_DIR = os.path.dirname(sys.executable)   # next to InvictusSROKP.exe
+else:
+    _BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # next to keypresser.py
+
+CONFIG_FILE           = os.path.join(_BASE_DIR, "keypresser_config.json")
+ALCHEMY_TEMPLATE_PATH = os.path.join(_BASE_DIR, "alchemy_template.png")
 
 # --------------------------------------------------------------------------
 # Default configuration
@@ -525,7 +534,14 @@ class AlchemyEngine:
                             and _IMAGE_MATCHING)
         use_ocr_stop = bool(self.stop_text and self.text_region and _OCR_AVAILABLE)
         mode_parts   = []
-        if use_template:  mode_parts.append("image targeting")
+        if use_template:
+            mode_parts.append("image targeting")
+        else:
+            if not _IMAGE_MATCHING:
+                self.log_cb("[Alchemy] ⚠ OpenCV/Pillow not available — falling back to cursor.")
+            elif not self.template_path or not os.path.exists(self.template_path):
+                self.log_cb(f"[Alchemy] ⚠ Template not found at: {self.template_path}")
+                self.log_cb("[Alchemy] ⚠ Use '📷 Set Fuse' to capture a new template.")
         if use_ocr_stop:  mode_parts.append(f"stop at '{self.stop_text}'")
         self.log_cb(f"[Alchemy] Started ({', '.join(mode_parts) or 'cursor position'}).")
         _miss_count = 0
