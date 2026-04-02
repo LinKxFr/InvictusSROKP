@@ -50,7 +50,7 @@ except ImportError:
 # ==============================================================================
 # Version & update config
 # ==============================================================================
-APP_VERSION  = 12                         # bump this with every release
+APP_VERSION  = 13                         # bump this with every release
 GITHUB_REPO  = "LinKxFr/InvictusSROKP"   # used for update checks
 
 
@@ -131,7 +131,8 @@ DEFAULT_CONFIG = {
     "alchemy_hotkey":     "F8",
     "alchemy_text_region": None,   # [x, y, w, h] in screen coords
     "alchemy_stop_text":  "changed to [5].",
-    "alchemy_stop_level": 5,              # stop when detected level >= this (0 = off)
+    "alchemy_stop_level": 5,              # stop when detected level >= this
+    "alchemy_stop_level_enabled": True,   # whether the >= level check is active
 }
 
 # --------------------------------------------------------------------------
@@ -601,7 +602,7 @@ class AlchemyEngine:
                     # Text detected but no [N] — likely a failure result
                     if not self._had_text_no_level:
                         self._had_text_no_level = True
-                        self.log_cb("[Alchemy] ⚠ Alchemy seems to have failed — keeping going…")
+                        self.log_cb("[Alchemy] ⚠ Alchemy seems to have failed, but we don't give up…")
                 # Exact text stop (kept as secondary / fallback condition)
                 if self.stop_text and self.stop_text.lower() in ocr.lower():
                     self.log_cb("[Alchemy] Stop condition met — target reached!")
@@ -994,9 +995,33 @@ class KeyPresserApp(tk.Tk):
                  font=("Segoe UI", 8)).pack(side="left", padx=(8, 2))
         self._alchemy_stop_text_var = tk.StringVar(
             value=self.config_data.get("alchemy_stop_text", "changed to [5]."))
-        tk.Entry(row3, textvariable=self._alchemy_stop_text_var, width=28,
+        tk.Entry(row3, textvariable=self._alchemy_stop_text_var, width=20,
                  bg=BG3, fg=TEAL, insertbackground=FG, relief="flat",
-                 font=("Consolas", 8)).pack(side="left", padx=(0, 8))
+                 font=("Consolas", 8)).pack(side="left", padx=(0, 6))
+
+        # Checkbox: also stop when level >= N
+        self._alchemy_stop_level_enabled_var = tk.BooleanVar(
+            value=self.config_data.get("alchemy_stop_level_enabled", True))
+        _vcmd2 = (self.register(lambda s: s.isdigit() or s == ''), '%P')
+        self._alchemy_stop_level_var = tk.IntVar(
+            value=self.config_data.get("alchemy_stop_level", 5))
+        self._alchemy_level_spinbox = tk.Spinbox(
+            row3, from_=1, to=20, textvariable=self._alchemy_stop_level_var,
+            width=3, bg=BG3, fg=TEAL, relief="flat",
+            validate="key", validatecommand=_vcmd2,
+            font=("Consolas", 9))
+
+        def _toggle_level_spinbox(*_):
+            state = "normal" if self._alchemy_stop_level_enabled_var.get() else "disabled"
+            self._alchemy_level_spinbox.config(state=state)
+
+        tk.Checkbutton(row3, text="or ≥ level", variable=self._alchemy_stop_level_enabled_var,
+                       command=_toggle_level_spinbox,
+                       bg=BG, fg=FG2, activebackground=BG, activeforeground=FG,
+                       selectcolor=BG3, relief="flat",
+                       font=("Segoe UI", 8)).pack(side="left", padx=(0, 2))
+        self._alchemy_level_spinbox.pack(side="left", padx=(0, 8))
+        _toggle_level_spinbox()   # set initial spinbox state
 
         has_rgn = bool(self.config_data.get("alchemy_text_region"))
         self._alchemy_region_lbl = tk.Label(
@@ -1014,22 +1039,6 @@ class KeyPresserApp(tk.Tk):
         if not _OCR_AVAILABLE:
             tk.Label(row3, text="  ⚠ pytesseract not installed",
                      fg=YELLOW, bg=BG, font=("Segoe UI", 7, "italic")).pack(side="left", padx=4)
-
-        # ── Row 4: ≥ level stop ───────────────────────────────────────────
-        row4 = tk.Frame(outer, bg=BG)
-        row4.pack(fill="x", padx=10, pady=(0, 8))
-
-        tk.Label(row4, text="Stop at level ≥", fg=FG2, bg=BG,
-                 font=("Segoe UI", 8)).pack(side="left")
-        self._alchemy_stop_level_var = tk.IntVar(
-            value=self.config_data.get("alchemy_stop_level", 5))
-        _vcmd2 = (self.register(lambda s: s.isdigit() or s == ''), '%P')
-        tk.Spinbox(row4, from_=0, to=20, textvariable=self._alchemy_stop_level_var,
-                   width=4, bg=BG3, fg=TEAL, relief="flat",
-                   validate="key", validatecommand=_vcmd2,
-                   font=("Consolas", 9)).pack(side="left", padx=(4, 6))
-        tk.Label(row4, text="(0 = disabled — uses text match only)",
-                 fg=FG2, bg=BG, font=("Segoe UI", 7, "italic")).pack(side="left")
 
     def toggle_alchemy(self):
         if self._alchemy_engine and self._alchemy_engine.running:
@@ -1051,7 +1060,7 @@ class KeyPresserApp(tk.Tk):
             template_path = ALCHEMY_TEMPLATE_PATH,
             text_region   = self.config_data.get("alchemy_text_region"),
             stop_text     = self._alchemy_stop_text_var.get(),
-            stop_level    = self._alchemy_stop_level_var.get(),
+            stop_level    = self._alchemy_stop_level_var.get() if self._alchemy_stop_level_enabled_var.get() else 0,
             stop_cb       = lambda: self.after(0, self.stop_alchemy),
         )
         self._alchemy_engine.start()
@@ -1802,7 +1811,8 @@ class KeyPresserApp(tk.Tk):
             "alchemy_hotkey":     self._alchemy_hk_var.get().strip(),
             "alchemy_text_region": self.config_data.get("alchemy_text_region"),
             "alchemy_stop_text":  self._alchemy_stop_text_var.get().strip(),
-            "alchemy_stop_level": self._alchemy_stop_level_var.get(),
+            "alchemy_stop_level":         self._alchemy_stop_level_var.get(),
+            "alchemy_stop_level_enabled": self._alchemy_stop_level_enabled_var.get(),
         }
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
