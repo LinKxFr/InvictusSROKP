@@ -50,7 +50,7 @@ except ImportError:
 # ==============================================================================
 # Version & update config
 # ==============================================================================
-APP_VERSION  = 11                         # bump this with every release
+APP_VERSION  = 12                         # bump this with every release
 GITHUB_REPO  = "LinKxFr/InvictusSROKP"   # used for update checks
 
 
@@ -131,6 +131,7 @@ DEFAULT_CONFIG = {
     "alchemy_hotkey":     "F8",
     "alchemy_text_region": None,   # [x, y, w, h] in screen coords
     "alchemy_stop_text":  "changed to [5].",
+    "alchemy_stop_level": 5,              # stop when detected level >= this (0 = off)
 }
 
 # --------------------------------------------------------------------------
@@ -269,39 +270,44 @@ class KeyPressEngine:
         self.running = False
 
     def _loop(self):
-        self.log_cb("Engine started — sending keys to target window.")
+        self.log_cb("Engine started — each key fires on its own independent timer.")
         lost_focus_logged = False
 
+        # Each key tracks its own next-fire timestamp — fully independent
+        now = time.time()
+        next_fire = [now for _ in self.sequence]
+
         while self.running:
-            fg = get_foreground_hwnd()
-            if fg != self.target_hwnd:
+            now = time.time()
+            fg  = get_foreground_hwnd()
+            focused = (fg == self.target_hwnd)
+
+            if not focused:
                 if not lost_focus_logged:
                     self.log_cb("Focus lost — keypresses paused.")
                     lost_focus_logged = True
-                time.sleep(0.1)
+                time.sleep(0.05)
                 continue
 
             if lost_focus_logged:
                 self.log_cb("Focus regained — resuming keypresses.")
                 lost_focus_logged = False
 
-            for step in self.sequence:
+            for i, step in enumerate(self.sequence):
                 if not self.running:
                     break
-                if get_foreground_hwnd() != self.target_hwnd:
-                    break
+                if now < next_fire[i]:
+                    continue                          # not yet time for this key
 
-                label   = step["key"]
                 vk_code = step.get("vk", 0)
-                delay_s = step["delay_ms"] / 1000.0
-
                 if vk_code:
                     send_vk_key(vk_code, hold_ms=20)
-                    self.log_cb(f"Key '{label}' sent  (VK=0x{vk_code:02X}, {step['delay_ms']} ms)")
                 else:
-                    self.log_cb(f"Key '{label}' SKIPPED — no VK code. Use the Capture button.")
+                    self.log_cb(f"Key '{step['key']}' SKIPPED — no VK code.")
 
-                time.sleep(delay_s)
+                next_fire[i] = now + step["delay_ms"] / 1000.0
+
+            time.sleep(0.005)   # 5 ms polling resolution
 
         self.log_cb("Engine stopped.")
 
@@ -458,6 +464,7 @@ class AlchemyEngine:
     def __init__(self, target_hwnd: int, delay_ms: int, log_cb,
                  template_path: str = "",
                  text_region=None, stop_text: str = "",
+                 stop_level: int = 0,
                  stop_cb=None):
         self.target_hwnd  = target_hwnd
         self.delay_ms     = max(100, delay_ms)
@@ -465,9 +472,11 @@ class AlchemyEngine:
         self.template_path = template_path
         self.text_region  = text_region   # [x, y, w, h] or None
         self.stop_text    = stop_text.strip().lower()
+        self.stop_level   = stop_level    # stop when detected level >= this (0 = off)
         self.stop_cb      = stop_cb       # called (no args) when stop condition met
         self.running      = False
         self._last_level: int | None = None   # tracks last logged alchemy level
+        self._had_text_no_level = False        # de-duplicates failure warning
         self._thread: threading.Thread | None = None
 
     def start(self):
@@ -573,17 +582,28 @@ class AlchemyEngine:
                 if not self.running:
                     break
                 ocr = self._ocr_region()
-                # ── Progressive level logging ─────────────────────────────
+                # ── Progressive level logging + stop conditions ───────────
                 m = re.search(r'\[(\d+)\]', ocr, re.IGNORECASE)
                 if m:
                     level = int(m.group(1))
                     if level != self._last_level:
                         self._last_level = level
+                        self._had_text_no_level = False
                         self.log_cb(f"[Alchemy] ★ Level {level} reached!")
+                    # Stop if level >= target (>= check)
+                    if self.stop_level > 0 and level >= self.stop_level:
+                        self.log_cb(f"[Alchemy] Stop — level {level} ≥ {self.stop_level}!")
+                        self.running = False
+                        if self.stop_cb:
+                            self.stop_cb()
+                        break
                 elif ocr.strip():
-                    # No level pattern — show raw OCR for debugging
-                    self.log_cb(f"[Alchemy] OCR: {ocr.strip()[:80]!r}")
-                if self.stop_text.lower() in ocr.lower():
+                    # Text detected but no [N] — likely a failure result
+                    if not self._had_text_no_level:
+                        self._had_text_no_level = True
+                        self.log_cb("[Alchemy] ⚠ Alchemy seems to have failed — keeping going…")
+                # Exact text stop (kept as secondary / fallback condition)
+                if self.stop_text and self.stop_text.lower() in ocr.lower():
                     self.log_cb("[Alchemy] Stop condition met — target reached!")
                     self.running = False
                     if self.stop_cb:
@@ -995,6 +1015,22 @@ class KeyPresserApp(tk.Tk):
             tk.Label(row3, text="  ⚠ pytesseract not installed",
                      fg=YELLOW, bg=BG, font=("Segoe UI", 7, "italic")).pack(side="left", padx=4)
 
+        # ── Row 4: ≥ level stop ───────────────────────────────────────────
+        row4 = tk.Frame(outer, bg=BG)
+        row4.pack(fill="x", padx=10, pady=(0, 8))
+
+        tk.Label(row4, text="Stop at level ≥", fg=FG2, bg=BG,
+                 font=("Segoe UI", 8)).pack(side="left")
+        self._alchemy_stop_level_var = tk.IntVar(
+            value=self.config_data.get("alchemy_stop_level", 5))
+        _vcmd2 = (self.register(lambda s: s.isdigit() or s == ''), '%P')
+        tk.Spinbox(row4, from_=0, to=20, textvariable=self._alchemy_stop_level_var,
+                   width=4, bg=BG3, fg=TEAL, relief="flat",
+                   validate="key", validatecommand=_vcmd2,
+                   font=("Consolas", 9)).pack(side="left", padx=(4, 6))
+        tk.Label(row4, text="(0 = disabled — uses text match only)",
+                 fg=FG2, bg=BG, font=("Segoe UI", 7, "italic")).pack(side="left")
+
     def toggle_alchemy(self):
         if self._alchemy_engine and self._alchemy_engine.running:
             self.stop_alchemy()
@@ -1015,6 +1051,7 @@ class KeyPresserApp(tk.Tk):
             template_path = ALCHEMY_TEMPLATE_PATH,
             text_region   = self.config_data.get("alchemy_text_region"),
             stop_text     = self._alchemy_stop_text_var.get(),
+            stop_level    = self._alchemy_stop_level_var.get(),
             stop_cb       = lambda: self.after(0, self.stop_alchemy),
         )
         self._alchemy_engine.start()
@@ -1765,6 +1802,7 @@ class KeyPresserApp(tk.Tk):
             "alchemy_hotkey":     self._alchemy_hk_var.get().strip(),
             "alchemy_text_region": self.config_data.get("alchemy_text_region"),
             "alchemy_stop_text":  self._alchemy_stop_text_var.get().strip(),
+            "alchemy_stop_level": self._alchemy_stop_level_var.get(),
         }
         try:
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
