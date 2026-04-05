@@ -50,7 +50,7 @@ except ImportError:
 # ==============================================================================
 # Version & update config
 # ==============================================================================
-APP_VERSION  = 13                         # bump this with every release
+APP_VERSION  = 14                         # bump this with every release
 GITHUB_REPO  = "LinKxFr/InvictusSROKP"   # used for update checks
 
 
@@ -756,10 +756,18 @@ class KeyPresserApp(tk.Tk):
                   bg=BG3, fg=GREEN, activebackground=BORDER, activeforeground=FG,
                   relief="flat", padx=8, pady=3, font=("Segoe UI", 9),
                   cursor="hand2").pack(side="left")
-        tk.Button(row_ctrl, text="⏱ Set All Delays", command=self._set_all_delays,
+        _vcmd_d = (self.register(lambda s: s.isdigit() or s == ''), '%P')
+        self._all_delay_var = tk.IntVar(value=50)
+        tk.Spinbox(row_ctrl, from_=1, to=9999, textvariable=self._all_delay_var,
+                   width=5, bg=BG3, fg=YELLOW, relief="flat",
+                   validate="key", validatecommand=_vcmd_d,
+                   font=("Consolas", 9)).pack(side="left", padx=(6, 2))
+        tk.Label(row_ctrl, text="ms", fg=FG2, bg=BG,
+                 font=("Segoe UI", 8)).pack(side="left", padx=(0, 4))
+        tk.Button(row_ctrl, text="⏱ Set All", command=self._set_all_delays,
                   bg=BG3, fg=YELLOW, activebackground=BORDER, activeforeground=FG,
                   relief="flat", padx=8, pady=3, font=("Segoe UI", 9),
-                  cursor="hand2").pack(side="left", padx=(6, 0))
+                  cursor="hand2").pack(side="left")
         tk.Label(row_ctrl, text="  ⊙ Capture = click then press the physical key",
                  fg=FG2, bg=BG, font=("Segoe UI", 7, "italic")).pack(side="left", padx=8)
 
@@ -789,13 +797,16 @@ class KeyPresserApp(tk.Tk):
         tk.Label(inner_ctrl, text="│", fg=BORDER, bg=BG,
                  font=("Segoe UI", 12)).pack(side="left", padx=(0, 8))
 
-        # Hotkeys inline — single toggle key
+        # Hotkeys inline — single toggle key (read-only, click to capture)
         tk.Label(inner_ctrl, text="Toggle:", fg=FG2, bg=BG,
                  font=("Segoe UI", 8)).pack(side="left")
         self._hk_start_var = tk.StringVar(value=self.config_data.get("hotkey_start", "F6"))
-        tk.Entry(inner_ctrl, textvariable=self._hk_start_var, width=5, bg=BG3, fg=ACCENT,
-                 insertbackground=FG, relief="flat",
-                 font=("Consolas", 8)).pack(side="left", padx=(3, 8))
+        _hk_seq_entry = tk.Entry(inner_ctrl, textvariable=self._hk_start_var, width=5,
+                                 bg=BG3, fg=ACCENT, relief="flat", font=("Consolas", 8),
+                                 state="readonly", readonlybackground=BG3, cursor="hand2")
+        _hk_seq_entry.pack(side="left", padx=(3, 8))
+        _hk_seq_entry.bind("<Button-1>",
+                           lambda e: self._capture_hotkey(self._hk_start_var, _hk_seq_entry))
 
         tk.Button(inner_ctrl, text="Apply", command=self._register_hotkeys,
                   bg=BG3, fg=YELLOW, activebackground=BORDER, activeforeground=FG,
@@ -940,9 +951,12 @@ class KeyPresserApp(tk.Tk):
                  font=("Segoe UI", 9)).pack(side="left")
         self._alchemy_hk_var = tk.StringVar(
             value=self.config_data.get("alchemy_hotkey", "F8"))
-        tk.Entry(row, textvariable=self._alchemy_hk_var, width=5,
-                 bg=BG3, fg=ACCENT, insertbackground=FG, relief="flat",
-                 font=("Consolas", 9)).pack(side="left", padx=(4, 4))
+        _hk_alch_entry = tk.Entry(row, textvariable=self._alchemy_hk_var, width=5,
+                                  bg=BG3, fg=ACCENT, relief="flat", font=("Consolas", 9),
+                                  state="readonly", readonlybackground=BG3, cursor="hand2")
+        _hk_alch_entry.pack(side="left", padx=(4, 4))
+        _hk_alch_entry.bind("<Button-1>",
+                            lambda e: self._capture_hotkey(self._alchemy_hk_var, _hk_alch_entry))
         tk.Button(row, text="Apply", command=self._register_hotkeys,
                   bg=BG3, fg=YELLOW, activebackground=BORDER, activeforeground=FG,
                   relief="flat", padx=6, pady=2, font=("Segoe UI", 8),
@@ -1224,6 +1238,41 @@ class KeyPresserApp(tk.Tk):
                 self._log("[Alchemy] Test OCR: (no text detected)", "warn")
         except Exception as e:
             self._log(f"[Alchemy] Test OCR error: {e}", "warn")
+
+    def _capture_hotkey(self, var, entry):
+        """Read-only entry click handler: captures next physical key as a hotkey name."""
+        if self._capturing:
+            return
+        self._capturing = True
+        orig = var.get()
+        entry.config(state="normal")
+        var.set("▸ press…")
+        entry.config(state="readonly", fg=GREEN)
+
+        def _thread():
+            try:
+                event = keyboard.read_event(suppress=True)
+                while event.event_type != keyboard.KEY_DOWN:
+                    event = keyboard.read_event(suppress=True)
+                self.after(0, _apply, event.name)
+            except Exception as e:
+                self.after(0, lambda: self._log(f"Hotkey capture error: {e}", "error"))
+                self.after(0, _restore, orig)
+
+        def _apply(name):
+            entry.config(state="normal")
+            var.set(name)
+            entry.config(state="readonly", fg=ACCENT)
+            self._capturing = False
+            self._register_hotkeys()   # apply immediately
+
+        def _restore(name):
+            entry.config(state="normal")
+            var.set(name)
+            entry.config(state="readonly", fg=ACCENT)
+            self._capturing = False
+
+        threading.Thread(target=_thread, daemon=True).start()
 
     def _add_timed_row(self, key: str = "", vk: int = 0,
                        hold_ms: int = 200, interval_min: int = 60,
@@ -1584,15 +1633,12 @@ class KeyPresserApp(tk.Tk):
                     break
 
     def _set_all_delays(self):
-        from tkinter import simpledialog
-        val = simpledialog.askinteger(
-            "Set All Delays",
-            "Enter delay (ms) to apply to every key in the sequence:",
-            initialvalue=50, minvalue=1, maxvalue=9999, parent=self,
-        )
-        if val is not None:
-            for _, _, delay_var, _ in self._seq_rows:
-                delay_var.set(val)
+        try:
+            val = max(1, self._all_delay_var.get())
+        except (ValueError, tk.TclError):
+            return
+        for _, _, delay_var, _ in self._seq_rows:
+            delay_var.set(val)
 
     # ======================================================================
     # Key capture — shared by both seq rows and timed rows
@@ -1752,9 +1798,9 @@ class KeyPresserApp(tk.Tk):
         toggle_key  = self._hk_start_var.get().strip()
         alchemy_key = self._alchemy_hk_var.get().strip()
         try:
-            keyboard.add_hotkey(toggle_key, self.toggle_pressing, suppress=False)
+            keyboard.add_hotkey(toggle_key, lambda: self.after(0, self.toggle_pressing), suppress=False)
             if alchemy_key:
-                keyboard.add_hotkey(alchemy_key, self.toggle_alchemy, suppress=False)
+                keyboard.add_hotkey(alchemy_key, lambda: self.after(0, self.toggle_alchemy), suppress=False)
             self._log(
                 f"Hotkeys: Seq Toggle={toggle_key}  Alchemy={alchemy_key or '—'}",
                 "info")
