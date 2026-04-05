@@ -50,7 +50,7 @@ except ImportError:
 # ==============================================================================
 # Version & update config
 # ==============================================================================
-APP_VERSION  = 14                         # bump this with every release
+APP_VERSION  = 15                         # bump this with every release
 GITHUB_REPO  = "LinKxFr/InvictusSROKP"   # used for update checks
 
 
@@ -1797,10 +1797,26 @@ class KeyPresserApp(tk.Tk):
             pass
         toggle_key  = self._hk_start_var.get().strip()
         alchemy_key = self._alchemy_hk_var.get().strip()
+
+        # Debounce: the keyboard library fires on every OS key-repeat event,
+        # so a brief hold queues start→stop→start in rapid succession.
+        # Ignore any repeat call within 400 ms of the last accepted one.
+        _times: dict = {}
+        def _debounced(key: str, fn):
+            now = time.time()
+            if now - _times.get(key, 0) < 0.4:
+                return
+            _times[key] = now
+            self.after(0, fn)
+
         try:
-            keyboard.add_hotkey(toggle_key, lambda: self.after(0, self.toggle_pressing), suppress=False)
+            keyboard.add_hotkey(toggle_key,
+                                lambda: _debounced("seq", self.toggle_pressing),
+                                suppress=False)
             if alchemy_key:
-                keyboard.add_hotkey(alchemy_key, lambda: self.after(0, self.toggle_alchemy), suppress=False)
+                keyboard.add_hotkey(alchemy_key,
+                                    lambda: _debounced("alch", self.toggle_alchemy),
+                                    suppress=False)
             self._log(
                 f"Hotkeys: Seq Toggle={toggle_key}  Alchemy={alchemy_key or '—'}",
                 "info")
